@@ -65,8 +65,8 @@ export class AppController {
 
 
     const userAgents = await this.clientService.getUserAgents();
-    const totalHashRate = userAgents.reduce((acc, userAgent) => acc + parseFloat(userAgent.totalHashRate), 0);
-    const totalMiners = userAgents.reduce((acc, userAgent) => acc + parseInt(userAgent.count), 0);
+    const totalHashRate = userAgents.reduce((acc, userAgent) => acc + Number(userAgent.totalHashRate), 0);
+    const totalMiners = userAgents.reduce((acc, userAgent) => acc + Number(userAgent.count), 0);
     const blockHeight = (await firstValueFrom(this.bitcoinRpcService.newBlock$)).blocks;
     const blocksFound = await this.blocksService.getFoundBlocks();
 

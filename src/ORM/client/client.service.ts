@@ -84,6 +84,22 @@ export class ClientService {
             .execute();
     }
 
+    /** Soft-delete older sessions for the same worker on reconnect. */
+    public async softDeleteOtherSessions(
+        address: string,
+        clientName: string,
+        keepSessionId: string,
+    ) {
+        return await this.clientRepository
+            .createQueryBuilder()
+            .softDelete()
+            .where('address = :address', { address })
+            .andWhere('clientName = :clientName', { clientName })
+            .andWhere('sessionId != :keepSessionId', { keepSessionId })
+            .andWhere('deletedAt IS NULL')
+            .execute();
+    }
+
     public async heartbeat(address: string, clientName: string, sessionId: string, hashRate: number, updatedAt: Date) {
         return await this.clientRepository.update({ address, clientName, sessionId }, { hashRate, deletedAt: null, updatedAt });
     }
