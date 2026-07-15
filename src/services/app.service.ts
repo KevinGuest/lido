@@ -39,7 +39,8 @@ export class AppService implements OnModuleInit {
             setInterval(async () => {
                 console.log('Killing dead clients');
                 await this.clientService.killDeadClients();
-            }, 1000 * 60 * 5);
+                await this.clientService.pruneDuplicateSessions();
+            }, 1000 * 60);
 
             setInterval(async () => {
                 console.log('Deleting Old Blocks');

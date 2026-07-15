@@ -484,6 +484,12 @@ export class StratumV1Client {
                     startTime: new Date(),
                     bestDifficulty: 0
                 });
+                // Drop stale sessions for this worker after reconnect / app update.
+                await this.clientService.softDeleteOtherSessions(
+                    this.clientAuthorization.address,
+                    this.clientAuthorization.worker,
+                    this.extraNonceAndSessionId,
+                );
             })();
         }
 

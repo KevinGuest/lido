@@ -31,10 +31,7 @@ export class ClientController {
                 hashRate: worker.hashRate,
                 startTime: worker.startTime,
                 lastSeen: worker.updatedAt,
-                shares:
-                    shareCounts.get(
-                        `${worker.address}\0${worker.clientName}\0${worker.sessionId}`,
-                    ) ?? 0,
+                shares: sumSharesForWorker(shareCounts, worker.address, worker.clientName),
             })),
         };
     }
@@ -128,4 +125,19 @@ export class ClientController {
             startTime: worker.startTime
         }
     }
+}
+
+function sumSharesForWorker(
+    shareCounts: Map<string, number>,
+    address: string,
+    clientName: string,
+): number {
+    let total = 0;
+    for (const [key, count] of shareCounts) {
+        const [rowAddress, rowName] = key.split('\0');
+        if (rowAddress === address && rowName === clientName) {
+            total += count;
+        }
+    }
+    return total;
 }
