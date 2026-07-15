@@ -1,0 +1,20 @@
+{
+    "cSpell.words": [
+        "bitcoinjs",
+        "braiins",
+        "coinb",
+        "coinbasevalue",
+        "Fastify",
+        "getblocktemplate",
+        "getmininginfo",
+        "hexdata",
+        "merkle",
+        "nbits",
+        "ntime",
+        "prevhash",
+        "Satoshis",
+        "submitblock",
+        "Tempalte"
+    ],
+    "idf.portWin": "COM30"
+}
