@@ -1,4 +1,4 @@
-import { Controller, Get, NotFoundException, Param } from '@nestjs/common';
+import { Controller, Get, NotFoundException, Param, Query } from '@nestjs/common';
 
 import { AddressSettingsService } from '../../ORM/address-settings/address-settings.service';
 import { ClientStatisticsService } from '../../ORM/client-statistics/client-statistics.service';
@@ -18,6 +18,7 @@ export class ClientController {
     @Get()
     async getAllClients() {
         const workers = await this.clientService.getAllActive();
+        const shareCounts = await this.clientStatisticsService.getAcceptedShareCounts();
 
         return {
             workersCount: workers.length,
@@ -30,6 +31,10 @@ export class ClientController {
                 hashRate: worker.hashRate,
                 startTime: worker.startTime,
                 lastSeen: worker.updatedAt,
+                shares:
+                    shareCounts.get(
+                        `${worker.address}\0${worker.clientName}\0${worker.sessionId}`,
+                    ) ?? 0,
             })),
         };
     }
@@ -65,6 +70,21 @@ export class ClientController {
         return chartData;
     }
 
+    @Get(':address/:workerName/chart')
+    async getWorkerGroupChart(
+        @Param('address') address: string,
+        @Param('workerName') workerName: string,
+        @Query('hours') hoursRaw?: string,
+    ) {
+        const hours = Number(hoursRaw);
+        const lookbackHours = Number.isFinite(hours) && hours > 0 ? hours : 168;
+        return this.clientStatisticsService.getChartDataForGroup(
+            address,
+            workerName,
+            lookbackHours,
+        );
+    }
+
     @Get(':address/:workerName')
     async getWorkerGroupInfo(@Param('address') address: string, @Param('workerName') workerName: string) {
 
@@ -90,9 +110,13 @@ export class ClientController {
     @Get(':address/:workerName/:sessionId')
     async getWorkerInfo(@Param('address') address: string, @Param('workerName') workerName: string, @Param('sessionId') sessionId: string) {
 
+        if (sessionId === 'chart') {
+            throw new NotFoundException();
+        }
+
         const worker = await this.clientService.getBySessionId(address, workerName, sessionId);
         if (worker == null) {
-            return new NotFoundException();
+            throw new NotFoundException();
         }
         const chartData = await this.clientStatisticsService.getChartDataForSession(worker.address, worker.clientName, worker.sessionId);
 

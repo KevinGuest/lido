@@ -1,5 +1,5 @@
 import { CACHE_MANAGER } from '@nestjs/cache-manager';
-import { Controller, Get, Inject } from '@nestjs/common';
+import { Controller, Get, Inject, Query } from '@nestjs/common';
 import { Cache } from 'cache-manager';
 import { firstValueFrom } from 'rxjs';
 
@@ -46,8 +46,8 @@ export class AppController {
       uptime: this.uptime
     };
 
-    //1 min
-    await this.cacheManager.set(CACHE_KEY, data, 1 * 60 * 1000);
+    // Near-live dashboard
+    await this.cacheManager.set(CACHE_KEY, data, 15 * 1000);
 
     return data;
 
@@ -78,8 +78,7 @@ export class AppController {
       fee: 0
     }
 
-    //5 min
-    await this.cacheManager.set(CACHE_KEY, data, 5 * 60 * 1000);
+    await this.cacheManager.set(CACHE_KEY, data, 15 * 1000);
 
     return data;
   }
@@ -90,25 +89,53 @@ export class AppController {
     return miningInfo;
   }
 
-  @Get('info/chart')
-  public async infoChart() {
-
-
-    const CACHE_KEY = 'SITE_HASHRATE_GRAPH';
+  @Get('info/chart/miners')
+  public async infoChartMiners(
+    @Query('from') fromRaw?: string,
+    @Query('to') toRaw?: string,
+  ) {
+    const toMs = parseChartBound(toRaw, Date.now());
+    const fromMs = parseChartBound(fromRaw, this.uptime.getTime());
+    const CACHE_KEY = `SITE_MINER_HASHRATE_GRAPH_${fromMs}_${toMs}`;
     const cachedResult = await this.cacheManager.get(CACHE_KEY);
 
     if (cachedResult != null) {
       return cachedResult;
     }
 
-    const chartData = await this.clientStatisticsService.getChartDataForSite();
+    const chartData =
+      await this.clientStatisticsService.getChartDataForActiveMiners(fromMs, toMs);
 
-    //10 min
-    await this.cacheManager.set(CACHE_KEY, chartData, 10 * 60 * 1000);
+    await this.cacheManager.set(CACHE_KEY, chartData, 15 * 1000);
 
     return chartData;
-
-
   }
 
+  @Get('info/chart')
+  public async infoChart(
+    @Query('from') fromRaw?: string,
+    @Query('to') toRaw?: string,
+  ) {
+    const toMs = parseChartBound(toRaw, Date.now());
+    const fromMs = parseChartBound(fromRaw, this.uptime.getTime());
+    const CACHE_KEY = `SITE_HASHRATE_GRAPH_${fromMs}_${toMs}`;
+    const cachedResult = await this.cacheManager.get(CACHE_KEY);
+
+    if (cachedResult != null) {
+      return cachedResult;
+    }
+
+    const chartData = await this.clientStatisticsService.getChartDataForSite(fromMs, toMs);
+
+    await this.cacheManager.set(CACHE_KEY, chartData, 15 * 1000);
+
+    return chartData;
+  }
+
+}
+
+function parseChartBound(raw: string | undefined, fallbackMs: number): number {
+  if (!raw) return fallbackMs;
+  const parsed = new Date(raw).getTime();
+  return Number.isFinite(parsed) ? parsed : fallbackMs;
 }
