@@ -78,15 +78,8 @@ export class ClientStatisticsService {
     public async getChartDataForSite(fromMs?: number, toMs?: number) {
         const to = toMs ?? Date.now();
         const from = fromMs ?? to - 24 * 60 * 60 * 1000;
-        const spanMs = Math.max(to - from, 10 * 60 * 1000);
-        const spanHours = spanMs / (60 * 60 * 1000);
-
-        const bucketMs =
-            spanHours <= 24
-                ? 10 * 60 * 1000
-                : spanHours <= 72
-                  ? 30 * 60 * 1000
-                  : 60 * 60 * 1000;
+        // Align with 10-minute share slots so Live (24h) always has dense points.
+        const bucketMs = 10 * 60 * 1000;
 
         const query = `
             SELECT
@@ -189,14 +182,7 @@ export class ClientStatisticsService {
     public async getChartDataForActiveMiners(fromMs?: number, toMs?: number) {
         const to = toMs ?? Date.now();
         const from = fromMs ?? to - 24 * 60 * 60 * 1000;
-        const spanMs = Math.max(to - from, 10 * 60 * 1000);
-        const spanHours = spanMs / (60 * 60 * 1000);
-        const bucketMs =
-            spanHours <= 24
-                ? 10 * 60 * 1000
-                : spanHours <= 72
-                  ? 30 * 60 * 1000
-                  : 60 * 60 * 1000;
+        const bucketMs = 10 * 60 * 1000;
 
         const query = `
             SELECT
