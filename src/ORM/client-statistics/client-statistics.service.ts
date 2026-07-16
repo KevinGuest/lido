@@ -75,6 +75,16 @@ export class ClientStatisticsService {
         return map;
     }
 
+    public async getEarliestTimeMs(): Promise<number | null> {
+        const rows: Array<{ earliest: string | number | null }> =
+            await this.clientStatisticsRepository.query(`
+                SELECT MIN(time) AS earliest
+                FROM client_statistics_entity
+            `);
+        const value = Number(rows?.[0]?.earliest);
+        return Number.isFinite(value) && value > 0 ? value : null;
+    }
+
     public async getChartDataForSite(fromMs?: number, toMs?: number) {
         const to = toMs ?? Date.now();
         const from = fromMs ?? to - 24 * 60 * 60 * 1000;

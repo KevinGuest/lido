@@ -7,12 +7,14 @@ import { AddressSettingsService } from './ORM/address-settings/address-settings.
 import { BlocksService } from './ORM/blocks/blocks.service';
 import { ClientStatisticsService } from './ORM/client-statistics/client-statistics.service';
 import { ClientService } from './ORM/client/client.service';
+import { PoolMetaService } from './ORM/pool-meta/pool-meta.service';
 import { BitcoinRpcService } from './services/bitcoin-rpc.service';
 
 @Controller()
 export class AppController {
 
-  private uptime = new Date();
+  /** Process boot time — Uptime card resets on restart. */
+  private readonly bootAt = new Date();
 
   constructor(
     @Inject(CACHE_MANAGER) private readonly cacheManager: Cache,
@@ -21,6 +23,7 @@ export class AppController {
     private readonly blocksService: BlocksService,
     private readonly bitcoinRpcService: BitcoinRpcService,
     private readonly addressSettingsService: AddressSettingsService,
+    private readonly poolMetaService: PoolMetaService,
   ) { }
 
   @Get('info')
@@ -38,12 +41,14 @@ export class AppController {
     const blockData = await this.blocksService.getFoundBlocks();
     const userAgents = await this.clientService.getUserAgents();
     const highScores = await this.addressSettingsService.getHighScores();
+    const startedAt = await this.poolMetaService.getStartedAt();
 
     const data = {
       blockData,
       userAgents,
       highScores,
-      uptime: this.uptime
+      uptime: this.bootAt,
+      startedAt,
     };
 
     // Near-live dashboard
@@ -163,7 +168,8 @@ export class AppController {
     @Query('to') toRaw?: string,
   ) {
     const toMs = parseChartBound(toRaw, Date.now());
-    const fromMs = parseChartBound(fromRaw, this.uptime.getTime());
+    const startedAt = await this.poolMetaService.getStartedAt();
+    const fromMs = parseChartBound(fromRaw, startedAt.getTime());
     const CACHE_KEY = `SITE_MINER_HASHRATE_GRAPH_${fromMs}_${toMs}`;
     const cachedResult = await this.cacheManager.get(CACHE_KEY);
 
@@ -185,7 +191,8 @@ export class AppController {
     @Query('to') toRaw?: string,
   ) {
     const toMs = parseChartBound(toRaw, Date.now());
-    const fromMs = parseChartBound(fromRaw, this.uptime.getTime());
+    const startedAt = await this.poolMetaService.getStartedAt();
+    const fromMs = parseChartBound(fromRaw, startedAt.getTime());
     const CACHE_KEY = `SITE_HASHRATE_GRAPH_${fromMs}_${toMs}`;
     const cachedResult = await this.cacheManager.get(CACHE_KEY);
 

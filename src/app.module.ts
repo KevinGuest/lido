@@ -13,6 +13,7 @@ import { AddressSettingsModule } from './ORM/address-settings/address-settings.m
 import { BlocksModule } from './ORM/blocks/blocks.module';
 import { ClientStatisticsModule } from './ORM/client-statistics/client-statistics.module';
 import { ClientModule } from './ORM/client/client.module';
+import { PoolMetaModule } from './ORM/pool-meta/pool-meta.module';
 import { RpcBlocksModule } from './ORM/rpc-block/rpc-block.module';
 import { TelegramSubscriptionsModule } from './ORM/telegram-subscriptions/telegram-subscriptions.module';
 import { AppService } from './services/app.service';
@@ -35,7 +36,8 @@ const ORMModules = [
     TelegramSubscriptionsModule,
     BlocksModule,
     RpcBlocksModule,
-    ExternalSharesModule
+    ExternalSharesModule,
+    PoolMetaModule,
 ]
 
 @Module({
