@@ -14,6 +14,7 @@ import { NotificationService } from '../services/notification.service';
 import { IJobTemplate, StratumV1JobsService } from '../services/stratum-v1-jobs.service';
 import { StratumV2Service } from '../services/stratum-v2.service';
 import { DifficultyUtils } from '../utils/difficulty.utils';
+import { patchCoinbasePrefixVarint } from '../utils/coinbase-prefix.utils';
 import { MiningJob } from './MiningJob';
 import { StratumV1ClientStatistics } from './StratumV1ClientStatistics';
 import { BufferReader } from './sv2/sv2-binary-codec';
@@ -25,12 +26,20 @@ import {
     Sv2MsgType,
     Sv2Protocol,
 } from './sv2/sv2-constants';
+import {
+    deserializeOpenExtendedMiningChannel,
+    deserializeSubmitSharesExtended,
+    serializeNewExtendedMiningJob,
+    serializeOpenExtendedMiningChannelSuccess,
+} from './sv2/sv2-extended-messages';
 import { Sv2FrameReader, Sv2FrameWriter } from './sv2/sv2-frame';
 import {
     deserializeOpenStandardMiningChannel,
     deserializeRequestExtensions,
     deserializeSetupConnection,
     deserializeSubmitSharesStandard,
+    deserializeCloseChannel,
+    deserializeUpdateChannel,
     serializeNewMiningJob,
     serializeOpenMiningChannelError,
     serializeOpenStandardMiningChannelSuccess,
@@ -41,36 +50,49 @@ import {
     serializeSetupConnectionSuccess,
     serializeSubmitSharesError,
     serializeSubmitSharesSuccess,
+    serializeUpdateChannelError,
 } from './sv2/sv2-messages';
 import { Sv2NoiseSession } from './sv2/sv2-noise';
 
 const FIXED_STANDARD_EXTRANONCE2 = '0000000000000000';
 const DEFAULT_START_DIFFICULTY = 100000;
 const DEFAULT_MIN_DIFFICULTY = 0.001;
+const DEFAULT_TARGET_SHARES_PER_MINUTE = 2;
 const DEFAULT_MAX_SOCKET_BUFFER_BYTES = 256 * 1024;
 const DEFAULT_SOCKET_WRITE_TIMEOUT_MS = 2_000;
 const BIP320_CONSENSUS_VERSION_MASK = 0xe0001fff;
 
+interface ChannelJobState {
+    miningJob: MiningJob;
+    jobTemplate: IJobTemplate;
+    tipKey: string;
+    nBits: number;
+    prevHash: Buffer;
+    /** Precomputed merkle root for standard channels. */
+    merkleRoot?: Buffer;
+    /** Patched coinbase split for extended channels. */
+    coinbasePrefix?: Buffer;
+    coinbaseSuffix?: Buffer;
+    merklePath?: Buffer[];
+}
+
 interface ChannelState {
     channelId: number;
+    channelType: 'standard' | 'extended';
     extranoncePrefix: Buffer;
+    /** Miner-controlled extranonce bytes (8 standard / negotiated extended). */
+    extranonceSize: number;
     sessionDifficulty: number;
     maxTarget: Buffer;
     readyForJobs: boolean;
     activeTipKey: string | null;
-    jobs: Map<number, {
-        miningJob: MiningJob;
-        jobTemplate: IJobTemplate;
-        merkleRoot: Buffer;
-        tipKey: string;
-        nBits: number;
-        prevHash: Buffer;
-    }>;
+    jobs: Map<number, ChannelJobState>;
 }
 
 /**
- * SV2 Mining Protocol client: Noise + SetupConnection + standard channel jobs/shares.
- * Shares the V1 job-template stream; skips extended channels / JDP / Redis.
+ * SV2 Mining Protocol client: Noise + SetupConnection + standard/extended channels,
+ * UpdateChannel/CloseChannel, and share/job handling on the shared V1 template stream.
+ * Skips JDP / Redis.
  */
 export class StratumV2Client {
     private readonly sessionId = crypto.randomBytes(4).toString('hex');
@@ -96,6 +118,7 @@ export class StratumV2Client {
     private submissionHashes = new Set<string>();
     private readonly backgroundWork: NodeJS.Timeout[] = [];
     private lastSentMiningJobTimestamp: number | null = null;
+    private readonly targetSharesPerMinute: number;
 
     constructor(
         private readonly socket: Socket,
@@ -113,6 +136,7 @@ export class StratumV2Client {
         this.noiseSession = new Sv2NoiseSession(this.stratumV2Service.getNoiseConfig());
         this.statistics = new StratumV1ClientStatistics(this.clientStatisticsService);
         this.network = this.resolveNetwork();
+        this.targetSharesPerMinute = this.getTargetSharesPerMinute();
 
         this.socket.on('data', (data: Buffer) => {
             void this.handleSocketData(data);
@@ -226,8 +250,20 @@ export class StratumV2Client {
             case Sv2MsgType.OPEN_STANDARD_MINING_CHANNEL:
                 await this.handleOpenStandardMiningChannel(payload);
                 break;
+            case Sv2MsgType.OPEN_EXTENDED_MINING_CHANNEL:
+                await this.handleOpenExtendedMiningChannel(payload);
+                break;
             case Sv2MsgType.SUBMIT_SHARES_STANDARD:
                 await this.handleSubmitSharesStandard(payload);
+                break;
+            case Sv2MsgType.SUBMIT_SHARES_EXTENDED:
+                await this.handleSubmitSharesExtended(payload);
+                break;
+            case Sv2MsgType.UPDATE_CHANNEL:
+                await this.handleUpdateChannel(payload);
+                break;
+            case Sv2MsgType.CLOSE_CHANNEL:
+                this.handleCloseChannel(payload);
                 break;
             default:
                 console.warn(
@@ -310,9 +346,8 @@ export class StratumV2Client {
         this.address = address;
         this.workerName = workerName;
 
-        let sessionDifficulty = this.getInitialDifficulty();
-        sessionDifficulty = DifficultyUtils.clampDifficultyToMaxTarget(
-            sessionDifficulty,
+        const sessionDifficulty = this.resolveChannelDifficulty(
+            message.nominalHashRate,
             message.maxTarget,
         );
 
@@ -320,7 +355,9 @@ export class StratumV2Client {
         const extranoncePrefix = this.stratumV2Service.generateExtranoncePrefix(channelId);
         const channel: ChannelState = {
             channelId,
+            channelType: 'standard',
             extranoncePrefix,
+            extranonceSize: Buffer.byteLength(FIXED_STANDARD_EXTRANONCE2, 'hex'),
             sessionDifficulty,
             maxTarget: Buffer.from(message.maxTarget),
             readyForJobs: false,
@@ -353,10 +390,94 @@ export class StratumV2Client {
         );
     }
 
+    private async handleOpenExtendedMiningChannel(payload: Buffer): Promise<void> {
+        const message = deserializeOpenExtendedMiningChannel(new BufferReader(payload));
+        const { address, workerName } = this.parseUserIdentity(message.userIdentity);
+
+        if (!this.isValidAddress(address)) {
+            await this.sendOpenChannelError(message.requestId, 'unknown-user');
+            this.closeSocket();
+            return;
+        }
+
+        if (this.address != null && this.address !== address) {
+            await this.sendOpenChannelError(message.requestId, 'unknown-user');
+            return;
+        }
+
+        if (message.maxTarget.length !== 32 || message.maxTarget.every(byte => byte === 0)) {
+            await this.sendOpenChannelError(message.requestId, 'max-target-out-of-range');
+            return;
+        }
+
+        this.address = address;
+        this.workerName = workerName;
+
+        const channelId = this.stratumV2Service.getNextChannelId();
+        const extranoncePrefix = this.stratumV2Service.generateExtranoncePrefix(channelId);
+        const maxMinerExtranonceSize = Math.max(
+            0,
+            this.stratumV2Service.getExtendedTotalExtranonceSize() - extranoncePrefix.length,
+        );
+        const defaultMinerExtranonceSize = Math.min(
+            this.stratumV2Service.getExtendedMinerExtranonceSize(),
+            maxMinerExtranonceSize,
+        );
+        const requestedMinerExtranonceSize = Math.max(0, message.minExtranonceSize);
+        const extranonceSize = Math.max(defaultMinerExtranonceSize, requestedMinerExtranonceSize);
+        if (extranonceSize > maxMinerExtranonceSize) {
+            this.stratumV2Service.releaseExtranoncePrefix(channelId);
+            await this.sendOpenChannelError(message.requestId, 'min-extranonce-size-too-large');
+            return;
+        }
+
+        const sessionDifficulty = this.resolveChannelDifficulty(
+            message.nominalHashRate,
+            message.maxTarget,
+        );
+
+        const channel: ChannelState = {
+            channelId,
+            channelType: 'extended',
+            extranoncePrefix,
+            extranonceSize,
+            sessionDifficulty,
+            maxTarget: Buffer.from(message.maxTarget),
+            readyForJobs: false,
+            activeTipKey: null,
+            jobs: new Map(),
+        };
+        this.channels.set(channelId, channel);
+
+        await this.sendFrame(
+            Sv2MsgType.OPEN_EXTENDED_MINING_CHANNEL_SUCCESS,
+            serializeOpenExtendedMiningChannelSuccess({
+                requestId: message.requestId,
+                channelId,
+                target: DifficultyUtils.difficultyToTarget(sessionDifficulty),
+                extranonceSize,
+                extranoncePrefix,
+                groupChannelId: 0,
+            }),
+        );
+
+        channel.readyForJobs = true;
+
+        const jobTemplate = this.stratumV2Service.getLatestCanonicalJob();
+        if (jobTemplate != null) {
+            await this.sendJobsForChannel(channel, jobTemplate);
+        }
+
+        console.log(
+            `[SV2 ${this.sessionId}] Extended channel ${channelId} open `
+            + `for ${address}.${workerName} diff=${sessionDifficulty} en2=${extranonceSize}`,
+        );
+    }
+
     private async handleSubmitSharesStandard(payload: Buffer): Promise<void> {
         const submission = deserializeSubmitSharesStandard(new BufferReader(payload));
         const channel = this.channels.get(submission.channelId);
-        if (channel == null) {
+        if (channel == null || channel.channelType !== 'standard') {
             await this.sendShareError(submission.channelId, submission.sequenceNumber, 'invalid-channel-id');
             return;
         }
@@ -397,7 +518,8 @@ export class StratumV2Client {
         const { submissionDifficulty, hashBuffer } = DifficultyUtils.calculateDifficulty(header);
         const target = DifficultyUtils.difficultyToTarget(channel.sessionDifficulty);
         const meetsJobTarget = DifficultyUtils.meetsTarget(hashBuffer, target);
-        const isBlockCandidate = submissionDifficulty >= jobState.jobTemplate.blockData.networkDifficulty;
+        const isBlockCandidate = DifficultyUtils.meetsCompactTarget(hashBuffer, jobState.nBits)
+            || submissionDifficulty >= jobState.jobTemplate.blockData.networkDifficulty;
 
         if (!meetsJobTarget && !isBlockCandidate) {
             await this.sendShareError(submission.channelId, submission.sequenceNumber, 'difficulty-too-low');
@@ -474,7 +596,265 @@ export class StratumV2Client {
         );
     }
 
+    private async handleSubmitSharesExtended(payload: Buffer): Promise<void> {
+        const submission = deserializeSubmitSharesExtended(new BufferReader(payload));
+        const channel = this.channels.get(submission.channelId);
+        if (channel == null || channel.channelType !== 'extended') {
+            await this.sendShareError(submission.channelId, submission.sequenceNumber, 'invalid-channel-id');
+            return;
+        }
+
+        const jobState = channel.jobs.get(submission.jobId);
+        if (jobState == null
+            || jobState.coinbasePrefix == null
+            || jobState.coinbaseSuffix == null
+            || jobState.merklePath == null) {
+            await this.sendShareError(submission.channelId, submission.sequenceNumber, 'invalid-job-id');
+            await this.recordRejectedShare();
+            return;
+        }
+
+        if (submission.extranonce.length !== channel.extranonceSize) {
+            await this.sendShareError(submission.channelId, submission.sequenceNumber, 'invalid-extranonce-size');
+            await this.recordRejectedShare();
+            return;
+        }
+
+        const submissionKey = [
+            submission.channelId,
+            submission.jobId,
+            submission.nonce,
+            submission.ntime,
+            submission.version,
+            submission.extranonce.toString('hex'),
+        ].join(':');
+        if (this.submissionHashes.has(submissionKey)) {
+            await this.sendShareError(submission.channelId, submission.sequenceNumber, 'duplicate-share');
+            await this.recordRejectedShare();
+            return;
+        }
+        this.submissionHashes.add(submissionKey);
+
+        const coinbaseTxBytes = Buffer.concat([
+            jobState.coinbasePrefix,
+            channel.extranoncePrefix,
+            submission.extranonce,
+            jobState.coinbaseSuffix,
+        ]);
+        const coinbaseHash = bitcoinjs.crypto.hash256(coinbaseTxBytes);
+        const merkleRoot = jobState.miningJob.buildMerkleRootFromCoinbaseHash(
+            coinbaseHash,
+            jobState.merklePath,
+        );
+
+        const version = this.versionRollingEnabled
+            ? (submission.version >>> 0)
+            : (jobState.jobTemplate.block.version >>> 0);
+
+        const header = Buffer.alloc(80);
+        header.writeUInt32LE(version, 0);
+        jobState.prevHash.copy(header, 4);
+        merkleRoot.copy(header, 36);
+        header.writeUInt32LE(submission.ntime >>> 0, 68);
+        header.writeUInt32LE(jobState.nBits >>> 0, 72);
+        header.writeUInt32LE(submission.nonce >>> 0, 76);
+
+        const { submissionDifficulty, hashBuffer } = DifficultyUtils.calculateDifficulty(header);
+        const target = DifficultyUtils.difficultyToTarget(channel.sessionDifficulty);
+        const meetsJobTarget = DifficultyUtils.meetsTarget(hashBuffer, target);
+        const isBlockCandidate = DifficultyUtils.meetsCompactTarget(hashBuffer, jobState.nBits)
+            || submissionDifficulty >= jobState.jobTemplate.blockData.networkDifficulty;
+
+        if (!meetsJobTarget && !isBlockCandidate) {
+            await this.sendShareError(submission.channelId, submission.sequenceNumber, 'difficulty-too-low');
+            await this.recordRejectedShare();
+            return;
+        }
+
+        if (isBlockCandidate) {
+            console.log('!!! BLOCK FOUND (SV2 extended) !!!');
+            const updatedJobBlock = this.reconstructExtendedBlock(
+                jobState,
+                submission,
+                merkleRoot,
+                channel.extranoncePrefix,
+                version,
+            );
+            const blockHex = updatedJobBlock.toHex(false);
+            const result = await this.bitcoinRpcService.SUBMIT_BLOCK(blockHex);
+            await this.blocksService.save({
+                height: jobState.jobTemplate.blockData.height,
+                minerAddress: this.address,
+                worker: this.workerName,
+                sessionId: this.sessionId,
+                blockData: blockHex,
+            });
+            await this.notificationService.notifySubscribersBlockFound(
+                this.address,
+                jobState.jobTemplate.blockData.height,
+                updatedJobBlock,
+                result,
+            );
+            if (result == null) {
+                await this.addressSettingsService.resetBestDifficultyAndShares();
+            }
+        }
+
+        await this.ensureClientEntity(channel);
+        try {
+            await this.statistics.addShares(this.entity, channel.sessionDifficulty);
+            const now = new Date();
+            if (this.entity.updatedAt == null || now.getTime() - this.entity.updatedAt.getTime() > 60_000) {
+                await this.clientService.heartbeat(
+                    this.entity.address,
+                    this.entity.clientName,
+                    this.entity.sessionId,
+                    this.statistics.hashRate,
+                    now,
+                );
+                this.entity.updatedAt = now;
+            }
+            if (submissionDifficulty > this.entity.bestDifficulty) {
+                await this.clientService.updateBestDifficultyIfHigher(this.sessionId, submissionDifficulty);
+                this.entity.bestDifficulty = submissionDifficulty;
+                await this.addressSettingsService.updateBestDifficultyIfHigher(
+                    this.address,
+                    submissionDifficulty,
+                    this.userAgent,
+                );
+            }
+        } catch (error) {
+            console.log(error);
+        }
+
+        await this.sendFrame(
+            Sv2MsgType.SUBMIT_SHARES_SUCCESS,
+            serializeSubmitSharesSuccess({
+                channelId: submission.channelId,
+                lastSequenceNumber: submission.sequenceNumber,
+                newSubmitsAcceptedCount: 1,
+                newSharesSum: BigInt(Math.max(1, Math.floor(channel.sessionDifficulty))),
+            }),
+            SV2_CHANNEL_MSG_FLAG,
+        );
+    }
+
+    private async handleUpdateChannel(payload: Buffer): Promise<void> {
+        const message = deserializeUpdateChannel(new BufferReader(payload));
+        const channel = this.channels.get(message.channelId);
+        if (channel == null) {
+            await this.sendFrame(
+                Sv2MsgType.UPDATE_CHANNEL_ERROR,
+                serializeUpdateChannelError({
+                    channelId: message.channelId,
+                    errorCode: 'invalid-channel-id',
+                }),
+            );
+            return;
+        }
+
+        if (message.maximumTarget.length !== 32 || message.maximumTarget.every(byte => byte === 0)) {
+            await this.sendFrame(
+                Sv2MsgType.UPDATE_CHANNEL_ERROR,
+                serializeUpdateChannelError({
+                    channelId: message.channelId,
+                    errorCode: 'max-target-out-of-range',
+                }),
+            );
+            return;
+        }
+
+        channel.maxTarget = Buffer.from(message.maximumTarget);
+
+        if (!Number.isFinite(message.nominalHashRate) || message.nominalHashRate <= 0) {
+            return;
+        }
+
+        const nextDifficulty = this.resolveChannelDifficulty(
+            message.nominalHashRate,
+            channel.maxTarget,
+        );
+        if (nextDifficulty === channel.sessionDifficulty) {
+            return;
+        }
+
+        console.log(
+            `[SV2 ${this.sessionId}] Channel ${channel.channelId} update `
+            + `${channel.sessionDifficulty} → ${nextDifficulty}`,
+        );
+        channel.sessionDifficulty = nextDifficulty;
+
+        await this.sendFrame(
+            Sv2MsgType.SET_TARGET,
+            serializeSetTarget({
+                channelId: channel.channelId,
+                maxTarget: DifficultyUtils.difficultyToTarget(channel.sessionDifficulty),
+            }),
+            SV2_CHANNEL_MSG_FLAG,
+        );
+    }
+
+    private handleCloseChannel(payload: Buffer): void {
+        const message = deserializeCloseChannel(new BufferReader(payload));
+        const channel = this.channels.get(message.channelId);
+        if (channel == null) {
+            return;
+        }
+
+        this.stratumV2Service.releaseExtranoncePrefix(message.channelId);
+        this.channels.delete(message.channelId);
+        console.log(
+            `[SV2 ${this.sessionId}] Channel ${message.channelId} closed `
+            + `(${message.reasonCode || 'no-reason'})`,
+        );
+
+        if (this.channels.size === 0) {
+            this.closeSocket();
+        }
+    }
+
+    private reconstructExtendedBlock(
+        jobState: ChannelJobState,
+        submission: { nonce: number; ntime: number; extranonce: Buffer },
+        merkleRoot: Buffer,
+        extranoncePrefix: Buffer,
+        version: number,
+    ): bitcoinjs.Block {
+        const jobTemplate = jobState.jobTemplate;
+        const testBlock = Object.assign(new bitcoinjs.Block(), jobTemplate.block);
+        testBlock.transactions = jobTemplate.block.transactions.map(tx =>
+            Object.assign(new bitcoinjs.Transaction(), tx),
+        );
+
+        const coinbaseTx = bitcoinjs.Transaction.fromBuffer(Buffer.concat([
+            jobState.coinbasePrefix,
+            extranoncePrefix,
+            submission.extranonce,
+            jobState.coinbaseSuffix,
+        ]));
+        coinbaseTx.ins[0].witness = [Buffer.alloc(32)];
+        testBlock.transactions[0] = coinbaseTx;
+        testBlock.version = version | 0;
+        testBlock.nonce = submission.nonce >>> 0;
+        testBlock.timestamp = submission.ntime >>> 0;
+        testBlock.merkleRoot = merkleRoot;
+        testBlock.prevHash = Buffer.from(jobState.prevHash);
+        testBlock.bits = jobState.nBits;
+        return testBlock;
+    }
+
     private async sendJobsForChannel(
+        channel: ChannelState,
+        jobTemplate: IJobTemplate,
+    ): Promise<void> {
+        if (channel.channelType === 'extended') {
+            await this.sendExtendedJobsForChannel(channel, jobTemplate);
+            return;
+        }
+        await this.sendStandardJobsForChannel(channel, jobTemplate);
+    }
+
+    private async sendStandardJobsForChannel(
         channel: ChannelState,
         jobTemplate: IJobTemplate,
     ): Promise<void> {
@@ -495,10 +875,7 @@ export class StratumV2Client {
             channel.extranoncePrefix.toString('hex'),
             FIXED_STANDARD_EXTRANONCE2,
         );
-        const jobId = this.nextJobId++;
-        if (this.nextJobId > 0xffffffff) {
-            this.nextJobId = 1;
-        }
+        const jobId = this.allocateJobId();
 
         if (sendPrevHash || jobTemplate.blockData.clearJobs) {
             channel.jobs.clear();
@@ -550,6 +927,97 @@ export class StratumV2Client {
         );
 
         this.lastSentMiningJobTimestamp = jobTemplate.block.timestamp;
+    }
+
+    private async sendExtendedJobsForChannel(
+        channel: ChannelState,
+        jobTemplate: IJobTemplate,
+    ): Promise<void> {
+        const tipKey = `${jobTemplate.blockData.height}:${jobTemplate.block.prevHash.toString('hex')}`;
+        const sendPrevHash = channel.activeTipKey !== tipKey || jobTemplate.blockData.clearJobs;
+
+        const payoutInformation = this.getPayoutInformation();
+        const miningJob = new MiningJob(
+            this.configService,
+            this.network,
+            this.stratumV1JobsService.getNextId(),
+            payoutInformation,
+            jobTemplate,
+        );
+        this.stratumV1JobsService.addJob(miningJob);
+
+        const totalExtranonceSize = channel.extranoncePrefix.length + channel.extranonceSize;
+        const coinbasePrefix = patchCoinbasePrefixVarint(
+            miningJob.getCoinbasePrefixBuffer(),
+            totalExtranonceSize,
+        );
+        const coinbaseSuffix = miningJob.getCoinbaseSuffixBuffer();
+        const merklePath = miningJob.getMerkleBranchBuffers();
+        const jobId = this.allocateJobId();
+
+        if (sendPrevHash || jobTemplate.blockData.clearJobs) {
+            channel.jobs.clear();
+        }
+
+        channel.jobs.set(jobId, {
+            miningJob,
+            jobTemplate,
+            tipKey,
+            nBits: jobTemplate.block.bits >>> 0,
+            prevHash: Buffer.from(jobTemplate.block.prevHash),
+            coinbasePrefix,
+            coinbaseSuffix,
+            merklePath,
+        });
+
+        await this.sendFrame(
+            Sv2MsgType.NEW_EXTENDED_MINING_JOB,
+            serializeNewExtendedMiningJob({
+                channelId: channel.channelId,
+                jobId,
+                minNtime: sendPrevHash ? null : jobTemplate.block.timestamp,
+                version: jobTemplate.block.version >>> 0,
+                versionRollingAllowed: this.versionRollingEnabled,
+                merklePath,
+                coinbasePrefix,
+                coinbaseSuffix,
+            }),
+            SV2_CHANNEL_MSG_FLAG,
+        );
+
+        if (sendPrevHash) {
+            await this.sendFrame(
+                Sv2MsgType.SET_NEW_PREV_HASH,
+                serializeSetNewPrevHash({
+                    channelId: channel.channelId,
+                    jobId,
+                    prevHash: Buffer.from(jobTemplate.block.prevHash),
+                    minNtime: jobTemplate.block.timestamp >>> 0,
+                    nBits: jobTemplate.block.bits >>> 0,
+                }),
+                SV2_CHANNEL_MSG_FLAG,
+            );
+            channel.activeTipKey = tipKey;
+        }
+
+        await this.sendFrame(
+            Sv2MsgType.SET_TARGET,
+            serializeSetTarget({
+                channelId: channel.channelId,
+                maxTarget: DifficultyUtils.difficultyToTarget(channel.sessionDifficulty),
+            }),
+            SV2_CHANNEL_MSG_FLAG,
+        );
+
+        this.lastSentMiningJobTimestamp = jobTemplate.block.timestamp;
+    }
+
+    private allocateJobId(): number {
+        const jobId = this.nextJobId++;
+        if (this.nextJobId > 0xffffffff) {
+            this.nextJobId = 1;
+        }
+        return jobId;
     }
 
     private async checkDifficulty(): Promise<void> {
@@ -697,6 +1165,44 @@ export class StratumV2Client {
             return Math.max(minDiff, DEFAULT_MIN_DIFFICULTY);
         }
         return DEFAULT_START_DIFFICULTY;
+    }
+
+    private getTargetSharesPerMinute(): number {
+        const configured = Number(this.configService.get('SV2_TARGET_SHARES_PER_MINUTE'));
+        return Number.isFinite(configured) && configured > 0
+            ? configured
+            : DEFAULT_TARGET_SHARES_PER_MINUTE;
+    }
+
+    private getMinimumDifficulty(): number {
+        const minDiff = Number(this.configService.get('MINIMUM_DIFFICULTY'));
+        if (Number.isFinite(minDiff) && minDiff > 0) {
+            return Math.max(minDiff, DEFAULT_MIN_DIFFICULTY);
+        }
+        return DEFAULT_MIN_DIFFICULTY;
+    }
+
+    private clampDifficulty(difficulty: number): number {
+        if (!Number.isFinite(difficulty) || difficulty <= 0) {
+            return this.getInitialDifficulty();
+        }
+        return Math.max(difficulty, this.getMinimumDifficulty());
+    }
+
+    private resolveChannelDifficulty(nominalHashRate: number, maxTarget: Buffer): number {
+        let sessionDifficulty = this.getInitialDifficulty();
+        if (Number.isFinite(nominalHashRate) && nominalHashRate > 0) {
+            const calculated = DifficultyUtils.hashRateToDifficulty(
+                nominalHashRate,
+                this.targetSharesPerMinute,
+            );
+            if (Number.isFinite(calculated) && calculated > 0) {
+                sessionDifficulty = calculated;
+            }
+        }
+        return this.clampDifficulty(
+            DifficultyUtils.clampDifficultyToMaxTarget(sessionDifficulty, maxTarget),
+        );
     }
 
     private resolveNetwork(): bitcoinjs.networks.Network {

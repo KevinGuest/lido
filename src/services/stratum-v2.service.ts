@@ -33,7 +33,7 @@ const DEFAULT_SOCKET_TIMEOUT_MS = 1000 * 60 * 60;
 const DEFAULT_TCP_KEEPALIVE_INITIAL_DELAY_MS = 1000 * 60;
 
 /**
- * Dual-stack Stratum V2 listener (Mining Protocol, standard channels).
+ * Dual-stack Stratum V2 listener (Mining Protocol, standard + extended channels).
  * Enabled when ENABLE_STRATUM_V2=true. Listens on STRATUM_V2_PORT (default 4444).
  * Reuses StratumV1JobsService templates; V1 on STRATUM_PORT is unchanged.
  */
@@ -165,6 +165,14 @@ export class StratumV2Service implements OnModuleInit, OnModuleDestroy {
 
     public releaseExtranoncePrefix(channelId: number): void {
         this.extranonceManager?.release(channelId);
+    }
+
+    public getExtendedMinerExtranonceSize(): number {
+        return this.getExtranonceManager().minerExtranonceSize;
+    }
+
+    public getExtendedTotalExtranonceSize(): number {
+        return this.getExtranonceManager().totalSize;
     }
 
     private startCanonicalJobBroadcaster(): void {

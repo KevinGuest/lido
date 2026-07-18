@@ -4,6 +4,7 @@ const TRUE_DIFF_ONE = 2.695953529101131e67;
 const TRUE_DIFF_ONE_BIGINT = BigInt(
   '26959535291011309493156476344723991336010898738574164086137773096960',
 );
+const TWO_TO_256 = 1n << 256n;
 
 export class DifficultyUtils {
   static calculateDifficulty(header: Buffer): {
@@ -47,6 +48,50 @@ export class DifficultyUtils {
     return DifficultyUtils.compareLe256(hashBuffer, target) <= 0;
   }
 
+  /** Decode Bitcoin compact nBits to a 32-byte little-endian target. */
+  static compactToTarget(nBits: number): Buffer | null {
+    if (!Number.isInteger(nBits) || nBits < 0 || nBits > 0xffffffff) {
+      return null;
+    }
+
+    const size = nBits >>> 24;
+    let word = nBits & 0x007fffff;
+    if (size <= 3) {
+      word >>>= 8 * (3 - size);
+    }
+
+    const negative = word !== 0 && (nBits & 0x00800000) !== 0;
+    const overflow = word !== 0 && (
+      size > 34
+      || (word > 0xff && size > 33)
+      || (word > 0xffff && size > 32)
+    );
+    if (word === 0 || negative || overflow) {
+      return null;
+    }
+
+    const target = Buffer.alloc(32);
+    const offset = size <= 3 ? 0 : size - 3;
+    for (let byte = 0; byte < 3 && offset + byte < target.length; byte++) {
+      target[offset + byte] = (word >>> (byte * 8)) & 0xff;
+    }
+    return target;
+  }
+
+  static meetsCompactTarget(hashBuffer: Buffer, nBits: number): boolean {
+    if (hashBuffer.length !== 32) {
+      throw new Error('Hash must be 32 bytes');
+    }
+    const target = DifficultyUtils.compactToTarget(nBits);
+    return target != null && DifficultyUtils.meetsTarget(hashBuffer, target);
+  }
+
+  /** Map declared hashrate (H/s) to a share difficulty for the given shares/minute target. */
+  static hashRateToDifficulty(hashRate: number, sharesPerMinute: number): number {
+    const target = DifficultyUtils.hashRateToTarget(hashRate, sharesPerMinute);
+    return DifficultyUtils.targetToDifficulty(target);
+  }
+
   static clampDifficultyToMaxTarget(difficulty: number, maxTarget: Buffer): number {
     if (!maxTarget || maxTarget.length !== 32 || DifficultyUtils.isZeroTarget(maxTarget)) {
       return difficulty;
@@ -61,6 +106,26 @@ export class DifficultyUtils {
   static targetToDifficulty(target: Buffer): number {
     const targetNumber = DifficultyUtils.le256todouble(target);
     return targetNumber === 0 ? Number.POSITIVE_INFINITY : TRUE_DIFF_ONE / targetNumber;
+  }
+
+  private static hashRateToTarget(hashRate: number, sharesPerMinute: number): Buffer {
+    if (
+      !Number.isFinite(hashRate)
+      || hashRate <= 0
+      || !Number.isFinite(sharesPerMinute)
+      || sharesPerMinute <= 0
+    ) {
+      return Buffer.alloc(32, 0xff);
+    }
+
+    const secondsPerShare = 60 / sharesPerMinute;
+    const hashesPerShare = BigInt(Math.round(hashRate * secondsPerShare));
+    if (hashesPerShare === 0n) {
+      return Buffer.alloc(32, 0xff);
+    }
+
+    const target = (TWO_TO_256 - hashesPerShare) / (hashesPerShare + 1n);
+    return DifficultyUtils.bigIntToLe256(target);
   }
 
   private static isZeroTarget(target: Buffer): boolean {

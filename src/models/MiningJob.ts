@@ -100,6 +100,25 @@ export class MiningJob {
         return bitcoinjs.Transaction.fromBuffer(this.coinbaseTransaction.toBuffer());
     }
 
+    public getCoinbasePrefixBuffer(): Buffer {
+        return Buffer.from(this.coinbasePart1Buffer);
+    }
+
+    public getCoinbaseSuffixBuffer(): Buffer {
+        return Buffer.from(this.coinbasePart2Buffer);
+    }
+
+    public getMerkleBranchBuffers(): Buffer[] {
+        return this.merkleBranchBuffers.map(branch => Buffer.from(branch));
+    }
+
+    public buildMerkleRootFromCoinbaseHash(coinbaseHash: Buffer, merkleBranches?: Buffer[]): Buffer {
+        return this.calculateMerkleRootHash(
+            coinbaseHash,
+            merkleBranches ?? this.merkleBranchBuffers,
+        );
+    }
+
     public buildHeaderBuffer(jobTemplate: IJobTemplate, versionMask: number, nonce: number, extraNonce: string, extraNonce2: string, timestamp: number): Buffer {
         const coinbaseBuffer = Buffer.concat([
             this.coinbasePart1Buffer,
