@@ -511,6 +511,7 @@ export class StratumV1Client {
             if (!success) {
                 return false;
             }
+            await this.recordRejectedShare();
             return false;
         }
         const jobTemplate = this.stratumV1JobsService.getJobTemplateById(job.jobTemplateId);
@@ -525,6 +526,7 @@ export class StratumV1Client {
             if (!success) {
                 return false;
             }
+            await this.recordRejectedShare();
             return false;
         }
 
@@ -544,6 +546,7 @@ export class StratumV1Client {
             if (!success) {
                 return false;
             }
+            await this.recordRejectedShare();
             return false;
         } else {
             this.miningSubmissionHashes.add(submissionHash);
@@ -643,12 +646,27 @@ export class StratumV1Client {
                 return false;
             }
 
+            await this.recordRejectedShare();
             return false;
         }
 
         //await this.checkDifficulty();
         return false;
 
+    }
+
+    private async recordRejectedShare() {
+        if (!this.clientAuthorization || !this.statistics) {
+            return;
+        }
+        try {
+            await this.ensureClientEntity();
+            if (this.entity) {
+                await this.statistics.addRejected(this.entity);
+            }
+        } catch (e) {
+            console.log(e);
+        }
     }
 
     private async checkDifficulty() {

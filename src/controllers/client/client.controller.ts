@@ -19,6 +19,7 @@ export class ClientController {
     async getAllClients() {
         const workers = await this.clientService.getAllActive();
         const shareCounts = await this.clientStatisticsService.getAcceptedShareCounts();
+        const rejectedCounts = await this.clientStatisticsService.getRejectedShareCounts();
 
         return {
             workersCount: workers.length,
@@ -32,6 +33,11 @@ export class ClientController {
                 startTime: worker.startTime,
                 lastSeen: worker.updatedAt,
                 shares: sumSharesForWorker(shareCounts, worker.address, worker.clientName),
+                rejectedShares: sumSharesForWorker(
+                    rejectedCounts,
+                    worker.address,
+                    worker.clientName,
+                ),
             })),
         };
     }

@@ -28,6 +28,7 @@ export class ClientStatisticsService {
             {
                 shares: clientStatistic.shares,
                 acceptedCount: clientStatistic.acceptedCount,
+                rejectedCount: clientStatistic.rejectedCount ?? 0,
                 updatedAt: new Date()
             });
 
@@ -71,6 +72,30 @@ export class ClientStatisticsService {
         for (const row of rows) {
             const key = `${row.address}\0${row.clientName}\0${row.sessionId}`;
             map.set(key, Number(row.shares) || 0);
+        }
+        return map;
+    }
+
+    public async getRejectedShareCounts(): Promise<Map<string, number>> {
+        const rows: Array<{
+            address: string;
+            clientName: string;
+            sessionId: string;
+            rejected: string | number;
+        }> = await this.clientStatisticsRepository.query(`
+            SELECT
+                address,
+                clientName,
+                sessionId,
+                SUM(COALESCE(rejectedCount, 0)) AS rejected
+            FROM client_statistics_entity
+            GROUP BY address, clientName, sessionId
+        `);
+
+        const map = new Map<string, number>();
+        for (const row of rows) {
+            const key = `${row.address}\0${row.clientName}\0${row.sessionId}`;
+            map.set(key, Number(row.rejected) || 0);
         }
         return map;
     }

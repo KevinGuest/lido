@@ -31,5 +31,7 @@ export class ClientStatisticsEntity extends TrackedEntity {
     @Column({ default: 0, type: 'integer' })
     acceptedCount: number;
 
+    @Column({ default: 0, type: 'integer' })
+    rejectedCount: number;
 
 }

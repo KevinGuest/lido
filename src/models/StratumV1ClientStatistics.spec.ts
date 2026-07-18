@@ -35,6 +35,7 @@ describe('StratumV1ClientStatistics', () => {
             time: new Date('2026-05-06T12:00:00Z').getTime(),
             shares: 64,
             acceptedCount: 1,
+            rejectedCount: 0,
             address: client.address,
             clientName: client.clientName,
             sessionId: client.sessionId
@@ -50,6 +51,7 @@ describe('StratumV1ClientStatistics', () => {
             time: new Date('2026-05-06T12:00:00Z').getTime(),
             shares: 96,
             acceptedCount: 2,
+            rejectedCount: 0,
             address: client.address,
             clientName: client.clientName,
             sessionId: client.sessionId
@@ -66,6 +68,7 @@ describe('StratumV1ClientStatistics', () => {
             time: new Date('2026-05-06T12:00:00Z').getTime(),
             shares: 64,
             acceptedCount: 1,
+            rejectedCount: 0,
             address: client.address,
             clientName: client.clientName,
             sessionId: client.sessionId
@@ -74,6 +77,38 @@ describe('StratumV1ClientStatistics', () => {
             time: new Date('2026-05-06T12:10:00Z').getTime(),
             shares: 32,
             acceptedCount: 1,
+            rejectedCount: 0,
+            address: client.address,
+            clientName: client.clientName,
+            sessionId: client.sessionId
+        });
+    });
+
+    it('should insert a rejected share bucket when none exists yet', async () => {
+        await statistics.addRejected(client);
+
+        expect(clientStatisticsService.insert).toHaveBeenCalledWith({
+            time: new Date('2026-05-06T12:00:00Z').getTime(),
+            shares: 0,
+            acceptedCount: 0,
+            rejectedCount: 1,
+            address: client.address,
+            clientName: client.clientName,
+            sessionId: client.sessionId
+        });
+    });
+
+    it('should persist rejected shares on the minute flush', async () => {
+        await statistics.addShares(client, 64);
+        await statistics.addRejected(client);
+        jest.setSystemTime(new Date('2026-05-06T12:01:01Z'));
+        await statistics.addRejected(client);
+
+        expect(clientStatisticsService.update).toHaveBeenCalledWith({
+            time: new Date('2026-05-06T12:00:00Z').getTime(),
+            shares: 64,
+            acceptedCount: 1,
+            rejectedCount: 2,
             address: client.address,
             clientName: client.clientName,
             sessionId: client.sessionId

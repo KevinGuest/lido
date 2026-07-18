@@ -4,10 +4,13 @@ import { ClientEntity } from '../ORM/client/client.entity';
 const CACHE_SIZE = 30;
 const TARGET_SUBMISSION_PER_SECOND = 10;
 const MIN_DIFF = 0.00001;
+const SLOT_MS = 1000 * 60 * 10;
+
 export class StratumV1ClientStatistics {
 
     private shares: number = 0;
     private acceptedCount: number = 0;
+    private rejectedCount: number = 0;
 
     private submissionCacheStart: Date;
     private submissionCache: { time: Date, difficulty: number }[] = [];
@@ -28,15 +31,28 @@ export class StratumV1ClientStatistics {
         this.submissionCacheStart = new Date();
     }
 
+    private timeSlot(date = new Date()) {
+        return new Date(Math.floor(date.getTime() / SLOT_MS) * SLOT_MS).getTime();
+    }
+
+    private bucketPayload(client: ClientEntity) {
+        return {
+            time: this.currentTimeSlot,
+            shares: this.shares,
+            acceptedCount: this.acceptedCount,
+            rejectedCount: this.rejectedCount,
+            address: client.address,
+            clientName: client.clientName,
+            sessionId: client.sessionId,
+        };
+    }
 
     // We don't want to save them here because it can be DB intensive, instead do it every once in
     // awhile with saveShares()
     public async addShares(client: ClientEntity, targetDifficulty: number) {
 
-        // 10 min
-        var coeff = 1000 * 60 * 10;
         var date = new Date();
-        var timeSlot = new Date(Math.floor(date.getTime() / coeff) * coeff).getTime();
+        var timeSlot = this.timeSlot(date);
 
         if (this.submissionCache.length > CACHE_SIZE) {
             this.submissionCache.shift();
@@ -54,54 +70,27 @@ export class StratumV1ClientStatistics {
             this.currentTimeSlot = timeSlot;
             this.shares += targetDifficulty;
             this.acceptedCount++;
-            await this.clientStatisticsService.insert({
-                time: this.currentTimeSlot,
-                shares: this.shares,
-                acceptedCount: this.acceptedCount,
-                address: client.address,
-                clientName: client.clientName,
-                sessionId: client.sessionId
-            });
+            await this.clientStatisticsService.insert(this.bucketPayload(client));
             this.lastSave = new Date().getTime();
         } else if (this.currentTimeSlot != timeSlot) {
             // Transitioning to a new time slot,
             // First update the old time slot with the latest data
-            await this.clientStatisticsService.update({
-                time: this.currentTimeSlot,
-                shares: this.shares,
-                acceptedCount: this.acceptedCount,
-                address: client.address,
-                clientName: client.clientName,
-                sessionId: client.sessionId
-            });
+            await this.clientStatisticsService.update(this.bucketPayload(client));
 			 this.previousShares = this.shares;
             this.previousTimeSlotTime = this.currentTimeSlotTime;
             this.currentTimeSlotTime = new Date();
             // Set the new time slot and add incoming shares then insert it
             this.currentTimeSlot = timeSlot;
             this.shares = targetDifficulty;
-            this.acceptedCount = 1
-            await this.clientStatisticsService.insert({
-                time: this.currentTimeSlot,
-                shares: this.shares,
-                acceptedCount: this.acceptedCount,
-                address: client.address,
-                clientName: client.clientName,
-                sessionId: client.sessionId
-            });
+            this.acceptedCount = 1;
+            this.rejectedCount = 0;
+            await this.clientStatisticsService.insert(this.bucketPayload(client));
             this.lastSave = new Date().getTime();
         } else if ((date.getTime() - 60 * 1000) > this.lastSave) {
             // If we haven't saved for a minute, update the table
             this.shares += targetDifficulty;
             this.acceptedCount++;
-            await this.clientStatisticsService.update({
-                time: this.currentTimeSlot,
-                shares: this.shares,
-                acceptedCount: this.acceptedCount,
-                address: client.address,
-                clientName: client.clientName,
-                sessionId: client.sessionId
-            });
+            await this.clientStatisticsService.update(this.bucketPayload(client));
             this.lastSave = new Date().getTime();
         } else {
             // Accept the shares if none of the prior conditions are met,
@@ -114,6 +103,42 @@ export class StratumV1ClientStatistics {
         }
         }
 
+    }
+
+    /** Count a rejected mining.submit (stale / duplicate / low-diff). Does not affect hashrate. */
+    public async addRejected(client: ClientEntity) {
+        const date = new Date();
+        const timeSlot = this.timeSlot(date);
+
+        if (this.currentTimeSlot == null) {
+            this.previousTimeSlotTime = new Date();
+            this.currentTimeSlotTime = new Date();
+            this.currentTimeSlot = timeSlot;
+            this.rejectedCount = 1;
+            await this.clientStatisticsService.insert(this.bucketPayload(client));
+            this.lastSave = date.getTime();
+            return;
+        }
+
+        if (this.currentTimeSlot != timeSlot) {
+            await this.clientStatisticsService.update(this.bucketPayload(client));
+            this.previousShares = this.shares;
+            this.previousTimeSlotTime = this.currentTimeSlotTime;
+            this.currentTimeSlotTime = new Date();
+            this.currentTimeSlot = timeSlot;
+            this.shares = 0;
+            this.acceptedCount = 0;
+            this.rejectedCount = 1;
+            await this.clientStatisticsService.insert(this.bucketPayload(client));
+            this.lastSave = date.getTime();
+            return;
+        }
+
+        this.rejectedCount++;
+        if ((date.getTime() - 60 * 1000) > this.lastSave) {
+            await this.clientStatisticsService.update(this.bucketPayload(client));
+            this.lastSave = date.getTime();
+        }
     }
 
     public getSuggestedDifficulty(clientDifficulty: number) {
