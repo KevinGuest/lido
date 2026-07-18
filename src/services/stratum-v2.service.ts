@@ -2,7 +2,12 @@ import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as crypto from 'crypto';
 import { Server, Socket } from 'net';
+import { Subscription } from 'rxjs';
 
+import { AddressSettingsService } from '../ORM/address-settings/address-settings.service';
+import { BlocksService } from '../ORM/blocks/blocks.service';
+import { ClientStatisticsService } from '../ORM/client-statistics/client-statistics.service';
+import { ClientService } from '../ORM/client/client.service';
 import { StratumV2Client } from '../models/StratumV2Client';
 import { encodeSv2AuthorityPublicKey } from '../models/sv2/sv2-authority-key';
 import {
@@ -20,14 +25,17 @@ import {
     Sv2ServerKeypair,
     xOnlyPubKeyFromPriv,
 } from '../models/sv2/sv2-noise';
+import { BitcoinRpcService } from './bitcoin-rpc.service';
+import { NotificationService } from './notification.service';
+import { IJobTemplate, StratumV1JobsService } from './stratum-v1-jobs.service';
 
 const DEFAULT_SOCKET_TIMEOUT_MS = 1000 * 60 * 60;
 const DEFAULT_TCP_KEEPALIVE_INITIAL_DELAY_MS = 1000 * 60;
 
 /**
- * Dual-stack Stratum V2 listener (Mining Protocol only).
- * Enabled when ENABLE_STRATUM_V2=true. Listens on STRATUM_V2_PORT (default 3334).
- * V1 on STRATUM_PORT remains unchanged.
+ * Dual-stack Stratum V2 listener (Mining Protocol, standard channels).
+ * Enabled when ENABLE_STRATUM_V2=true. Listens on STRATUM_V2_PORT (default 4444).
+ * Reuses StratumV1JobsService templates; V1 on STRATUM_PORT is unchanged.
  */
 @Injectable()
 export class StratumV2Service implements OnModuleInit, OnModuleDestroy {
@@ -41,8 +49,19 @@ export class StratumV2Service implements OnModuleInit, OnModuleDestroy {
     private channelIdCounter = 1;
     private extranonceManager: Sv2ExtranonceManager = null;
     private enabled = false;
+    private latestCanonicalJob: IJobTemplate = null;
+    private canonicalJobSubscription: Subscription = null;
 
-    constructor(private readonly configService: ConfigService) {}
+    constructor(
+        private readonly configService: ConfigService,
+        private readonly stratumV1JobsService: StratumV1JobsService,
+        private readonly bitcoinRpcService: BitcoinRpcService,
+        private readonly clientService: ClientService,
+        private readonly clientStatisticsService: ClientStatisticsService,
+        private readonly notificationService: NotificationService,
+        private readonly blocksService: BlocksService,
+        private readonly addressSettingsService: AddressSettingsService,
+    ) {}
 
     public async onModuleInit(): Promise<void> {
         if (process.env.API_ONLY === 'true' || process.env.MASTER === 'true') {
@@ -57,6 +76,7 @@ export class StratumV2Service implements OnModuleInit, OnModuleDestroy {
 
         this.getExtranonceManager();
         await this.ensureInitialized();
+        this.startCanonicalJobBroadcaster();
 
         const ports = this.getPorts();
         for (const port of ports) {
@@ -65,6 +85,9 @@ export class StratumV2Service implements OnModuleInit, OnModuleDestroy {
     }
 
     public async onModuleDestroy(): Promise<void> {
+        this.canonicalJobSubscription?.unsubscribe();
+        this.canonicalJobSubscription = null;
+
         const clients = Array.from(this.clients);
         this.clients.clear();
         await Promise.allSettled(clients.map(client => client.destroy()));
@@ -88,7 +111,19 @@ export class StratumV2Service implements OnModuleInit, OnModuleDestroy {
             throw new Error('Stratum V2 service is not initialized');
         }
 
-        const client = new StratumV2Client(socket, firstChunk, this);
+        const client = new StratumV2Client(
+            socket,
+            firstChunk,
+            this,
+            this.stratumV1JobsService,
+            this.bitcoinRpcService,
+            this.clientService,
+            this.clientStatisticsService,
+            this.notificationService,
+            this.blocksService,
+            this.configService,
+            this.addressSettingsService,
+        );
         this.registerClient(client);
         return client;
     }
@@ -99,6 +134,10 @@ export class StratumV2Service implements OnModuleInit, OnModuleDestroy {
 
     public unregisterClient(client: StratumV2Client): void {
         this.clients.delete(client);
+    }
+
+    public getLatestCanonicalJob(): IJobTemplate | null {
+        return this.latestCanonicalJob;
     }
 
     public getNoiseConfig(): Sv2NoiseConfig {
@@ -128,6 +167,25 @@ export class StratumV2Service implements OnModuleInit, OnModuleDestroy {
         this.extranonceManager?.release(channelId);
     }
 
+    private startCanonicalJobBroadcaster(): void {
+        if (this.canonicalJobSubscription != null) {
+            return;
+        }
+        this.canonicalJobSubscription = this.stratumV1JobsService.newMiningJob$.subscribe({
+            next: jobTemplate => {
+                this.latestCanonicalJob = jobTemplate;
+                for (const client of this.clients) {
+                    void client.enqueueCanonicalJob(jobTemplate).catch(error => {
+                        console.error(`SV2 canonical job enqueue failed: ${error.message}`);
+                        this.unregisterClient(client);
+                        void client.destroy();
+                    });
+                }
+            },
+            error: error => console.error(`SV2 canonical job subscription failed: ${error.message}`),
+        });
+    }
+
     private isEnabled(): boolean {
         const flag = this.configService.get<string>('ENABLE_STRATUM_V2');
         return flag === 'true' || flag === '1';
@@ -136,7 +194,7 @@ export class StratumV2Service implements OnModuleInit, OnModuleDestroy {
     private getPorts(): number[] {
         const raw = this.configService.get<string>('STRATUM_V2_PORTS')
             ?? this.configService.get<string>('STRATUM_V2_PORT')
-            ?? '3334';
+            ?? '4444';
         return raw
             .split(',')
             .map(part => Number.parseInt(part.trim(), 10))

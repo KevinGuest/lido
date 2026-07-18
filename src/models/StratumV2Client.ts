@@ -1,7 +1,21 @@
+import { ConfigService } from '@nestjs/config';
+import { getAddressInfo } from 'bitcoin-address-validation';
+import * as bitcoinjs from 'bitcoinjs-lib';
 import * as crypto from 'crypto';
 import { Socket } from 'net';
 
+import { AddressSettingsService } from '../ORM/address-settings/address-settings.service';
+import { BlocksService } from '../ORM/blocks/blocks.service';
+import { ClientEntity } from '../ORM/client/client.entity';
+import { ClientStatisticsService } from '../ORM/client-statistics/client-statistics.service';
+import { ClientService } from '../ORM/client/client.service';
+import { BitcoinRpcService } from '../services/bitcoin-rpc.service';
+import { NotificationService } from '../services/notification.service';
+import { IJobTemplate, StratumV1JobsService } from '../services/stratum-v1-jobs.service';
 import { StratumV2Service } from '../services/stratum-v2.service';
+import { DifficultyUtils } from '../utils/difficulty.utils';
+import { MiningJob } from './MiningJob';
+import { StratumV1ClientStatistics } from './StratumV1ClientStatistics';
 import { BufferReader } from './sv2/sv2-binary-codec';
 import {
     SV2_CHANNEL_MSG_FLAG,
@@ -13,26 +27,57 @@ import {
 } from './sv2/sv2-constants';
 import { Sv2FrameReader, Sv2FrameWriter } from './sv2/sv2-frame';
 import {
+    deserializeOpenStandardMiningChannel,
     deserializeRequestExtensions,
     deserializeSetupConnection,
+    deserializeSubmitSharesStandard,
+    serializeNewMiningJob,
+    serializeOpenMiningChannelError,
+    serializeOpenStandardMiningChannelSuccess,
     serializeRequestExtensionsSuccess,
+    serializeSetNewPrevHash,
+    serializeSetTarget,
     serializeSetupConnectionError,
     serializeSetupConnectionSuccess,
+    serializeSubmitSharesError,
+    serializeSubmitSharesSuccess,
 } from './sv2/sv2-messages';
 import { Sv2NoiseSession } from './sv2/sv2-noise';
 
+const FIXED_STANDARD_EXTRANONCE2 = '0000000000000000';
+const DEFAULT_START_DIFFICULTY = 100000;
+const DEFAULT_MIN_DIFFICULTY = 0.001;
 const DEFAULT_MAX_SOCKET_BUFFER_BYTES = 256 * 1024;
-const DEFAULT_SOCKET_WRITE_TIMEOUT_MS = 2 * 1000;
+const DEFAULT_SOCKET_WRITE_TIMEOUT_MS = 2_000;
+const BIP320_CONSENSUS_VERSION_MASK = 0xe0001fff;
+
+interface ChannelState {
+    channelId: number;
+    extranoncePrefix: Buffer;
+    sessionDifficulty: number;
+    readyForJobs: boolean;
+    activeTipKey: string | null;
+    jobs: Map<number, {
+        miningJob: MiningJob;
+        jobTemplate: IJobTemplate;
+        merkleRoot: Buffer;
+        tipKey: string;
+        nBits: number;
+        prevHash: Buffer;
+    }>;
+}
 
 /**
- * Milestone-1 SV2 client: Noise NX handshake + SetupConnection (Mining Protocol).
- * Channel open / job / share handling lands in later slices.
+ * SV2 Mining Protocol client: Noise + SetupConnection + standard channel jobs/shares.
+ * Shares the V1 job-template stream; skips extended channels / JDP / Redis.
  */
 export class StratumV2Client {
     private readonly sessionId = crypto.randomBytes(4).toString('hex');
     private readonly noiseSession: Sv2NoiseSession;
     private readonly frameReader = new Sv2FrameReader(null);
     private readonly frameWriter = new Sv2FrameWriter(null);
+    private readonly statistics: StratumV1ClientStatistics;
+    private readonly network: bitcoinjs.networks.Network;
 
     private handshakeBuffer = Buffer.alloc(0);
     private handshakeComplete = false;
@@ -41,14 +86,30 @@ export class StratumV2Client {
     private pendingSocketWriteBytes = 0;
     private userAgent = 'unknown/sv2';
     private versionRollingEnabled = false;
-    private workSelectionEnabled = false;
+    private address: string = null;
+    private workerName = 'default';
+    private entity: ClientEntity = null;
+    private creatingEntity: Promise<void> = null;
+    private nextJobId = 1;
+    private readonly channels = new Map<number, ChannelState>();
+    private submissionHashes = new Set<string>();
 
     constructor(
         private readonly socket: Socket,
         firstChunk: Buffer,
         private readonly stratumV2Service: StratumV2Service,
+        private readonly stratumV1JobsService: StratumV1JobsService,
+        private readonly bitcoinRpcService: BitcoinRpcService,
+        private readonly clientService: ClientService,
+        private readonly clientStatisticsService: ClientStatisticsService,
+        private readonly notificationService: NotificationService,
+        private readonly blocksService: BlocksService,
+        private readonly configService: ConfigService,
+        private readonly addressSettingsService: AddressSettingsService,
     ) {
         this.noiseSession = new Sv2NoiseSession(this.stratumV2Service.getNoiseConfig());
+        this.statistics = new StratumV1ClientStatistics(this.clientStatisticsService);
+        this.network = this.resolveNetwork();
 
         this.socket.on('data', (data: Buffer) => {
             void this.handleSocketData(data);
@@ -62,7 +123,23 @@ export class StratumV2Client {
             return;
         }
         this.destroyed = true;
+        for (const channel of this.channels.values()) {
+            this.stratumV2Service.releaseExtranoncePrefix(channel.channelId);
+        }
+        this.channels.clear();
         this.stratumV2Service.unregisterClient(this);
+        if (this.entity?.sessionId != null) {
+            await this.clientService.delete(this.entity.sessionId);
+        }
+    }
+
+    public async enqueueCanonicalJob(jobTemplate: IJobTemplate): Promise<void> {
+        for (const channel of this.channels.values()) {
+            if (!channel.readyForJobs) {
+                continue;
+            }
+            await this.sendJobsForChannel(channel, jobTemplate);
+        }
     }
 
     private async handleSocketData(data: Buffer): Promise<void> {
@@ -133,10 +210,15 @@ export class StratumV2Client {
             case Sv2MsgType.SETUP_CONNECTION:
                 await this.handleSetupConnection(payload);
                 break;
+            case Sv2MsgType.OPEN_STANDARD_MINING_CHANNEL:
+                await this.handleOpenStandardMiningChannel(payload);
+                break;
+            case Sv2MsgType.SUBMIT_SHARES_STANDARD:
+                await this.handleSubmitSharesStandard(payload);
+                break;
             default:
                 console.warn(
-                    `[SV2 ${this.sessionId}] Ignoring message type 0x${msgType.toString(16)} `
-                    + '(channel/job/share handling not yet enabled)',
+                    `[SV2 ${this.sessionId}] Ignoring message type 0x${msgType.toString(16)}`,
                 );
                 break;
         }
@@ -149,10 +231,7 @@ export class StratumV2Client {
         if (message.protocol !== Sv2Protocol.MINING) {
             await this.sendFrame(
                 Sv2MsgType.SETUP_CONNECTION_ERROR,
-                serializeSetupConnectionError({
-                    flags: 0,
-                    errorCode: 'unsupported-protocol',
-                }),
+                serializeSetupConnectionError({ flags: 0, errorCode: 'unsupported-protocol' }),
             );
             this.closeSocket();
             return;
@@ -161,10 +240,7 @@ export class StratumV2Client {
         if (message.minVersion > 2 || message.maxVersion < 2) {
             await this.sendFrame(
                 Sv2MsgType.SETUP_CONNECTION_ERROR,
-                serializeSetupConnectionError({
-                    flags: 0,
-                    errorCode: 'protocol-version-mismatch',
-                }),
+                serializeSetupConnectionError({ flags: 0, errorCode: 'protocol-version-mismatch' }),
             );
             this.closeSocket();
             return;
@@ -186,22 +262,395 @@ export class StratumV2Client {
             return;
         }
 
-        const versionRolling = (message.flags & Sv2MiningSetupFlags.REQUIRES_VERSION_ROLLING) !== 0;
-        this.versionRollingEnabled = versionRolling;
-        this.workSelectionEnabled = (message.flags & Sv2MiningSetupFlags.REQUIRES_WORK_SELECTION) !== 0;
-        const successFlags = versionRolling ? 0 : Sv2MiningSetupSuccessFlags.REQUIRES_FIXED_VERSION;
+        this.versionRollingEnabled =
+            (message.flags & Sv2MiningSetupFlags.REQUIRES_VERSION_ROLLING) !== 0;
+        const successFlags = this.versionRollingEnabled
+            ? 0
+            : Sv2MiningSetupSuccessFlags.REQUIRES_FIXED_VERSION;
 
         await this.sendFrame(
             Sv2MsgType.SETUP_CONNECTION_SUCCESS,
-            serializeSetupConnectionSuccess({
-                usedVersion: 2,
-                flags: successFlags,
+            serializeSetupConnectionSuccess({ usedVersion: 2, flags: successFlags }),
+        );
+    }
+
+    private async handleOpenStandardMiningChannel(payload: Buffer): Promise<void> {
+        const message = deserializeOpenStandardMiningChannel(new BufferReader(payload));
+        const { address, workerName } = this.parseUserIdentity(message.user_identity);
+
+        if (!this.isValidAddress(address)) {
+            await this.sendOpenChannelError(message.requestId, 'unknown-user');
+            this.closeSocket();
+            return;
+        }
+
+        if (this.address != null && this.address !== address) {
+            await this.sendOpenChannelError(message.requestId, 'unknown-user');
+            return;
+        }
+
+        if (message.maxTarget.length !== 32 || message.maxTarget.every(byte => byte === 0)) {
+            await this.sendOpenChannelError(message.requestId, 'max-target-out-of-range');
+            return;
+        }
+
+        this.address = address;
+        this.workerName = workerName;
+
+        let sessionDifficulty = this.getInitialDifficulty();
+        sessionDifficulty = DifficultyUtils.clampDifficultyToMaxTarget(
+            sessionDifficulty,
+            message.maxTarget,
+        );
+
+        const channelId = this.stratumV2Service.getNextChannelId();
+        const extranoncePrefix = this.stratumV2Service.generateExtranoncePrefix(channelId);
+        const channel: ChannelState = {
+            channelId,
+            extranoncePrefix,
+            sessionDifficulty,
+            readyForJobs: false,
+            activeTipKey: null,
+            jobs: new Map(),
+        };
+        this.channels.set(channelId, channel);
+
+        await this.sendFrame(
+            Sv2MsgType.OPEN_STANDARD_MINING_CHANNEL_SUCCESS,
+            serializeOpenStandardMiningChannelSuccess({
+                requestId: message.requestId,
+                channelId,
+                target: DifficultyUtils.difficultyToTarget(sessionDifficulty),
+                extranonce_prefix: extranoncePrefix,
+                groupChannelId: 0,
             }),
         );
 
+        channel.readyForJobs = true;
+
+        const jobTemplate = this.stratumV2Service.getLatestCanonicalJob();
+        if (jobTemplate != null) {
+            await this.sendJobsForChannel(channel, jobTemplate);
+        }
+
         console.log(
-            `[SV2 ${this.sessionId}] SetupConnection ok vendor=${this.userAgent} `
-            + `versionRolling=${this.versionRollingEnabled} workSelection=${this.workSelectionEnabled}`,
+            `[SV2 ${this.sessionId}] Standard channel ${channelId} open `
+            + `for ${address}.${workerName} diff=${sessionDifficulty}`,
+        );
+    }
+
+    private async handleSubmitSharesStandard(payload: Buffer): Promise<void> {
+        const submission = deserializeSubmitSharesStandard(new BufferReader(payload));
+        const channel = this.channels.get(submission.channelId);
+        if (channel == null) {
+            await this.sendShareError(submission.channelId, submission.sequenceNumber, 'invalid-channel-id');
+            return;
+        }
+
+        const jobState = channel.jobs.get(submission.jobId);
+        if (jobState == null) {
+            await this.sendShareError(submission.channelId, submission.sequenceNumber, 'invalid-job-id');
+            await this.recordRejectedShare();
+            return;
+        }
+
+        const submissionKey = [
+            submission.channelId,
+            submission.jobId,
+            submission.nonce,
+            submission.ntime,
+            submission.version,
+        ].join(':');
+        if (this.submissionHashes.has(submissionKey)) {
+            await this.sendShareError(submission.channelId, submission.sequenceNumber, 'duplicate-share');
+            await this.recordRejectedShare();
+            return;
+        }
+        this.submissionHashes.add(submissionKey);
+
+        const versionMask = this.versionRollingEnabled
+            ? ((submission.version ^ jobState.jobTemplate.block.version) & ~BIP320_CONSENSUS_VERSION_MASK)
+            : 0;
+
+        const header = jobState.miningJob.buildHeaderBuffer(
+            jobState.jobTemplate,
+            versionMask,
+            submission.nonce >>> 0,
+            channel.extranoncePrefix.toString('hex'),
+            FIXED_STANDARD_EXTRANONCE2,
+            submission.ntime >>> 0,
+        );
+        const { submissionDifficulty, hashBuffer } = DifficultyUtils.calculateDifficulty(header);
+        const target = DifficultyUtils.difficultyToTarget(channel.sessionDifficulty);
+        const meetsJobTarget = DifficultyUtils.meetsTarget(hashBuffer, target);
+        const isBlockCandidate = submissionDifficulty >= jobState.jobTemplate.blockData.networkDifficulty;
+
+        if (!meetsJobTarget && !isBlockCandidate) {
+            await this.sendShareError(submission.channelId, submission.sequenceNumber, 'difficulty-too-low');
+            await this.recordRejectedShare();
+            return;
+        }
+
+        if (isBlockCandidate) {
+            console.log('!!! BLOCK FOUND (SV2) !!!');
+            const updatedJobBlock = jobState.miningJob.copyAndUpdateBlock(
+                jobState.jobTemplate,
+                versionMask,
+                submission.nonce >>> 0,
+                channel.extranoncePrefix.toString('hex'),
+                FIXED_STANDARD_EXTRANONCE2,
+                submission.ntime >>> 0,
+            );
+            const blockHex = updatedJobBlock.toHex(false);
+            const result = await this.bitcoinRpcService.SUBMIT_BLOCK(blockHex);
+            await this.blocksService.save({
+                height: jobState.jobTemplate.blockData.height,
+                minerAddress: this.address,
+                worker: this.workerName,
+                sessionId: this.sessionId,
+                blockData: blockHex,
+            });
+            await this.notificationService.notifySubscribersBlockFound(
+                this.address,
+                jobState.jobTemplate.blockData.height,
+                updatedJobBlock,
+                result,
+            );
+            if (result == null) {
+                await this.addressSettingsService.resetBestDifficultyAndShares();
+            }
+        }
+
+        await this.ensureClientEntity(channel);
+        try {
+            await this.statistics.addShares(this.entity, channel.sessionDifficulty);
+            const now = new Date();
+            if (this.entity.updatedAt == null || now.getTime() - this.entity.updatedAt.getTime() > 60_000) {
+                await this.clientService.heartbeat(
+                    this.entity.address,
+                    this.entity.clientName,
+                    this.entity.sessionId,
+                    this.statistics.hashRate,
+                    now,
+                );
+                this.entity.updatedAt = now;
+            }
+            if (submissionDifficulty > this.entity.bestDifficulty) {
+                await this.clientService.updateBestDifficultyIfHigher(this.sessionId, submissionDifficulty);
+                this.entity.bestDifficulty = submissionDifficulty;
+                await this.addressSettingsService.updateBestDifficultyIfHigher(
+                    this.address,
+                    submissionDifficulty,
+                    this.userAgent,
+                );
+            }
+        } catch (error) {
+            console.log(error);
+        }
+
+        await this.sendFrame(
+            Sv2MsgType.SUBMIT_SHARES_SUCCESS,
+            serializeSubmitSharesSuccess({
+                channelId: submission.channelId,
+                lastSequenceNumber: submission.sequenceNumber,
+                newSubmitsAcceptedCount: 1,
+                newSharesSum: BigInt(Math.max(1, Math.floor(channel.sessionDifficulty))),
+            }),
+            SV2_CHANNEL_MSG_FLAG,
+        );
+    }
+
+    private async sendJobsForChannel(
+        channel: ChannelState,
+        jobTemplate: IJobTemplate,
+    ): Promise<void> {
+        const tipKey = `${jobTemplate.blockData.height}:${jobTemplate.block.prevHash.toString('hex')}`;
+        const sendPrevHash = channel.activeTipKey !== tipKey || jobTemplate.blockData.clearJobs;
+
+        const payoutInformation = this.getPayoutInformation();
+        const miningJob = new MiningJob(
+            this.configService,
+            this.network,
+            this.stratumV1JobsService.getNextId(),
+            payoutInformation,
+            jobTemplate,
+        );
+        this.stratumV1JobsService.addJob(miningJob);
+
+        const merkleRoot = miningJob.buildCoinbaseMerkleRoot(
+            channel.extranoncePrefix.toString('hex'),
+            FIXED_STANDARD_EXTRANONCE2,
+        );
+        const jobId = this.nextJobId++;
+        if (this.nextJobId > 0xffffffff) {
+            this.nextJobId = 1;
+        }
+
+        if (sendPrevHash || jobTemplate.blockData.clearJobs) {
+            channel.jobs.clear();
+        }
+
+        channel.jobs.set(jobId, {
+            miningJob,
+            jobTemplate,
+            merkleRoot,
+            tipKey,
+            nBits: jobTemplate.block.bits >>> 0,
+            prevHash: Buffer.from(jobTemplate.block.prevHash),
+        });
+
+        await this.sendFrame(
+            Sv2MsgType.NEW_MINING_JOB,
+            serializeNewMiningJob({
+                channelId: channel.channelId,
+                jobId,
+                minNtime: sendPrevHash ? null : jobTemplate.block.timestamp,
+                version: jobTemplate.block.version >>> 0,
+                merkleRoot,
+            }),
+            SV2_CHANNEL_MSG_FLAG,
+        );
+
+        if (sendPrevHash) {
+            await this.sendFrame(
+                Sv2MsgType.SET_NEW_PREV_HASH,
+                serializeSetNewPrevHash({
+                    channelId: channel.channelId,
+                    jobId,
+                    prevHash: Buffer.from(jobTemplate.block.prevHash),
+                    minNtime: jobTemplate.block.timestamp >>> 0,
+                    nBits: jobTemplate.block.bits >>> 0,
+                }),
+                SV2_CHANNEL_MSG_FLAG,
+            );
+            channel.activeTipKey = tipKey;
+        }
+
+        await this.sendFrame(
+            Sv2MsgType.SET_TARGET,
+            serializeSetTarget({
+                channelId: channel.channelId,
+                maxTarget: DifficultyUtils.difficultyToTarget(channel.sessionDifficulty),
+            }),
+            SV2_CHANNEL_MSG_FLAG,
+        );
+    }
+
+    private getPayoutInformation(): { address: string; percent: number }[] {
+        const devFeeAddress = this.configService.get('DEV_FEE_ADDRESS');
+        const hashRate = this.statistics.hashRate;
+        const noFee = hashRate != 0 && hashRate < 50_000_000_000_000;
+        if (noFee || !devFeeAddress) {
+            return [{ address: this.address, percent: 100 }];
+        }
+        return [
+            { address: devFeeAddress, percent: 1.5 },
+            { address: this.address, percent: 98.5 },
+        ];
+    }
+
+    private async ensureClientEntity(channel: ChannelState): Promise<void> {
+        if (this.entity != null) {
+            return;
+        }
+        if (this.creatingEntity == null) {
+            this.creatingEntity = (async () => {
+                this.entity = await this.clientService.insert({
+                    sessionId: this.sessionId,
+                    address: this.address,
+                    clientName: this.workerName,
+                    userAgent: this.userAgent,
+                    startTime: new Date(),
+                    bestDifficulty: 0,
+                });
+                await this.clientService.softDeleteOtherSessions(
+                    this.address,
+                    this.workerName,
+                    this.sessionId,
+                );
+            })();
+        }
+        await this.creatingEntity;
+        void channel;
+    }
+
+    private async recordRejectedShare(): Promise<void> {
+        if (!this.address || !this.statistics) {
+            return;
+        }
+        try {
+            if (this.channels.size > 0) {
+                const channel = this.channels.values().next().value as ChannelState;
+                await this.ensureClientEntity(channel);
+            }
+            if (this.entity) {
+                await this.statistics.addRejected(this.entity);
+            }
+        } catch (error) {
+            console.log(error);
+        }
+    }
+
+    private parseUserIdentity(identity: string): { address: string; workerName: string } {
+        const trimmed = (identity || '').trim();
+        const dot = trimmed.indexOf('.');
+        if (dot <= 0) {
+            return { address: trimmed, workerName: 'default' };
+        }
+        return {
+            address: trimmed.slice(0, dot),
+            workerName: trimmed.slice(dot + 1) || 'default',
+        };
+    }
+
+    private isValidAddress(address: string): boolean {
+        try {
+            getAddressInfo(address);
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    private getInitialDifficulty(): number {
+        const configured = Number(this.configService.get('SV2_START_DIFFICULTY'));
+        if (Number.isFinite(configured) && configured > 0) {
+            return configured;
+        }
+        const minDiff = Number(this.configService.get('MINIMUM_DIFFICULTY'));
+        if (Number.isFinite(minDiff) && minDiff > 0) {
+            return Math.max(minDiff, DEFAULT_MIN_DIFFICULTY);
+        }
+        return DEFAULT_START_DIFFICULTY;
+    }
+
+    private resolveNetwork(): bitcoinjs.networks.Network {
+        const networkConfig = this.configService.get('NETWORK');
+        if (networkConfig === 'testnet') {
+            return bitcoinjs.networks.testnet;
+        }
+        if (networkConfig === 'regtest') {
+            return bitcoinjs.networks.regtest;
+        }
+        return bitcoinjs.networks.bitcoin;
+    }
+
+    private async sendOpenChannelError(requestId: number, errorCode: string): Promise<void> {
+        await this.sendFrame(
+            Sv2MsgType.OPEN_STANDARD_MINING_CHANNEL_ERROR,
+            serializeOpenMiningChannelError({ requestId, errorCode }),
+        );
+    }
+
+    private async sendShareError(
+        channelId: number,
+        sequenceNumber: number,
+        errorCode: string,
+    ): Promise<void> {
+        await this.sendFrame(
+            Sv2MsgType.SUBMIT_SHARES_ERROR,
+            serializeSubmitSharesError({ channelId, sequenceNumber, errorCode }),
+            SV2_CHANNEL_MSG_FLAG,
         );
     }
 

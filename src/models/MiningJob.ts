@@ -125,6 +125,17 @@ export class MiningJob {
         return header;
     }
 
+    /** Precompute merkle root for SV2 standard jobs (fixed extranonce2). */
+    public buildCoinbaseMerkleRoot(extraNonce: string, extraNonce2: string): Buffer {
+        const coinbaseBuffer = Buffer.concat([
+            this.coinbasePart1Buffer,
+            Buffer.from(`${extraNonce}${extraNonce2}`, 'hex'),
+            this.coinbasePart2Buffer,
+        ]);
+        const coinbaseHash = bitcoinjs.crypto.hash256(coinbaseBuffer);
+        return this.calculateMerkleRootHash(coinbaseHash, this.merkleBranchBuffers);
+    }
+
     public copyAndUpdateBlock(jobTemplate: IJobTemplate, versionMask: number, nonce: number, extraNonce: string, extraNonce2: string, timestamp: number): bitcoinjs.Block {
 
         const testBlock = Object.assign(new bitcoinjs.Block(), jobTemplate.block);
