@@ -55,6 +55,7 @@ interface ChannelState {
     channelId: number;
     extranoncePrefix: Buffer;
     sessionDifficulty: number;
+    maxTarget: Buffer;
     readyForJobs: boolean;
     activeTipKey: string | null;
     jobs: Map<number, {
@@ -93,6 +94,8 @@ export class StratumV2Client {
     private nextJobId = 1;
     private readonly channels = new Map<number, ChannelState>();
     private submissionHashes = new Set<string>();
+    private readonly backgroundWork: NodeJS.Timeout[] = [];
+    private lastSentMiningJobTimestamp: number | null = null;
 
     constructor(
         private readonly socket: Socket,
@@ -115,6 +118,12 @@ export class StratumV2Client {
             void this.handleSocketData(data);
         });
 
+        this.backgroundWork.push(
+            setInterval(() => {
+                void this.checkDifficulty();
+            }, 60 * 1000),
+        );
+
         void this.handleSocketData(firstChunk);
     }
 
@@ -123,6 +132,10 @@ export class StratumV2Client {
             return;
         }
         this.destroyed = true;
+        for (const work of this.backgroundWork) {
+            clearInterval(work);
+        }
+        this.backgroundWork.length = 0;
         for (const channel of this.channels.values()) {
             this.stratumV2Service.releaseExtranoncePrefix(channel.channelId);
         }
@@ -309,6 +322,7 @@ export class StratumV2Client {
             channelId,
             extranoncePrefix,
             sessionDifficulty,
+            maxTarget: Buffer.from(message.maxTarget),
             readyForJobs: false,
             activeTipKey: null,
             jobs: new Map(),
@@ -534,6 +548,67 @@ export class StratumV2Client {
             }),
             SV2_CHANNEL_MSG_FLAG,
         );
+
+        this.lastSentMiningJobTimestamp = jobTemplate.block.timestamp;
+    }
+
+    private async checkDifficulty(): Promise<void> {
+        if (this.destroyed || this.channels.size === 0) {
+            return;
+        }
+
+        for (const channel of this.channels.values()) {
+            if (!channel.readyForJobs) {
+                continue;
+            }
+
+            const suggested = this.statistics.getSuggestedDifficulty(channel.sessionDifficulty);
+            if (suggested == null) {
+                continue;
+            }
+
+            const targetDiff = DifficultyUtils.clampDifficultyToMaxTarget(
+                suggested,
+                channel.maxTarget,
+            );
+            if (targetDiff === channel.sessionDifficulty) {
+                continue;
+            }
+
+            console.log(
+                `[SV2 ${this.sessionId}] Channel ${channel.channelId} difficulty `
+                + `${channel.sessionDifficulty} → ${targetDiff}`,
+            );
+            channel.sessionDifficulty = targetDiff;
+
+            await this.sendFrame(
+                Sv2MsgType.SET_TARGET,
+                serializeSetTarget({
+                    channelId: channel.channelId,
+                    maxTarget: DifficultyUtils.difficultyToTarget(channel.sessionDifficulty),
+                }),
+                SV2_CHANNEL_MSG_FLAG,
+            );
+
+            const jobTemplate = this.stratumV2Service.getLatestCanonicalJob();
+            if (jobTemplate == null) {
+                continue;
+            }
+
+            const nextTimestamp = Math.max(
+                jobTemplate.block.timestamp,
+                Math.floor(Date.now() / 1000),
+                (this.lastSentMiningJobTimestamp ?? 0) + 1,
+            );
+            const refreshedJobTemplate: IJobTemplate = {
+                ...jobTemplate,
+                block: Object.assign(new bitcoinjs.Block(), jobTemplate.block, {
+                    timestamp: nextTimestamp,
+                }),
+                blockData: { ...jobTemplate.blockData, clearJobs: true },
+            };
+            await this.sendJobsForChannel(channel, refreshedJobTemplate);
+        }
     }
 
     private getPayoutInformation(): { address: string; percent: number }[] {
