@@ -22,7 +22,6 @@ import {
     SV2_CHANNEL_MSG_FLAG,
     SV2_NOISE_ACT1_SIZE,
     Sv2MiningSetupFlags,
-    Sv2MiningSetupSuccessFlags,
     Sv2MsgType,
     Sv2Protocol,
 } from './sv2/sv2-constants';
@@ -55,7 +54,7 @@ import {
 import { Sv2NoiseSession } from './sv2/sv2-noise';
 
 const FIXED_STANDARD_EXTRANONCE2 = '0000000000000000';
-const DEFAULT_START_DIFFICULTY = 100000;
+const DEFAULT_START_DIFFICULTY = 1000;
 const DEFAULT_MIN_DIFFICULTY = 0.001;
 const DEFAULT_TARGET_SHARES_PER_MINUTE = 2;
 const DEFAULT_MAX_SOCKET_BUFFER_BYTES = 256 * 1024;
@@ -108,7 +107,6 @@ export class StratumV2Client {
     private destroyed = false;
     private pendingSocketWriteBytes = 0;
     private userAgent = 'unknown';
-    private versionRollingEnabled = false;
     private address: string = null;
     private workerName = 'default';
     private entity: ClientEntity = null;
@@ -314,15 +312,13 @@ export class StratumV2Client {
             return;
         }
 
-        this.versionRollingEnabled =
-            (message.flags & Sv2MiningSetupFlags.REQUIRES_VERSION_ROLLING) !== 0;
-        const successFlags = this.versionRollingEnabled
-            ? 0
-            : Sv2MiningSetupSuccessFlags.REQUIRES_FIXED_VERSION;
-
+        // ESP-Miner / NerdQAxe always enable BIP320 version rolling (0x1fffe000) on
+        // SV2 regardless of SetupConnection flags. Refusing rolling caused every
+        // submitted share to fail difficulty-too-low (pool rebuilt the wrong header).
+        // See https://github.com/bitaxeorg/ESP-Miner/issues/1758
         await this.sendFrame(
             Sv2MsgType.SETUP_CONNECTION_SUCCESS,
-            serializeSetupConnectionSuccess({ usedVersion: 2, flags: successFlags }),
+            serializeSetupConnectionSuccess({ usedVersion: 2, flags: 0 }),
         );
     }
 
@@ -386,6 +382,9 @@ export class StratumV2Client {
         if (jobTemplate != null) {
             await this.sendJobsForChannel(channel, jobTemplate);
         }
+
+        await this.ensureClientEntity(channel);
+        await this.heartbeatOnline();
 
         console.log(
             `[SV2 ${this.sessionId}] Standard channel ${channelId} open `
@@ -471,6 +470,9 @@ export class StratumV2Client {
             await this.sendJobsForChannel(channel, jobTemplate);
         }
 
+        await this.ensureClientEntity(channel);
+        await this.heartbeatOnline();
+
         console.log(
             `[SV2 ${this.sessionId}] Extended channel ${channelId} open `
             + `for ${address}.${workerName} diff=${sessionDifficulty} en2=${extranonceSize}`,
@@ -506,9 +508,15 @@ export class StratumV2Client {
         }
         this.submissionHashes.add(submissionKey);
 
-        const versionMask = this.versionRollingEnabled
-            ? ((submission.version ^ jobState.jobTemplate.block.version) & ~BIP320_CONSENSUS_VERSION_MASK)
-            : 0;
+        const jobVersion = jobState.jobTemplate.block.version >>> 0;
+        const submitVersion = submission.version >>> 0;
+        if (((submitVersion ^ jobVersion) & BIP320_CONSENSUS_VERSION_MASK) !== 0) {
+            await this.sendShareError(submission.channelId, submission.sequenceNumber, 'invalid-version');
+            await this.recordRejectedShare();
+            return;
+        }
+
+        const versionMask = (submitVersion ^ jobVersion) & ~BIP320_CONSENSUS_VERSION_MASK;
 
         const header = jobState.miningJob.buildHeaderBuffer(
             jobState.jobTemplate,
@@ -525,6 +533,11 @@ export class StratumV2Client {
             || submissionDifficulty >= jobState.jobTemplate.blockData.networkDifficulty;
 
         if (!meetsJobTarget && !isBlockCandidate) {
+            console.warn(
+                `[SV2 ${this.sessionId}] difficulty-too-low (standard) `
+                + `job=${submission.jobId} shareDiff=${submissionDifficulty.toFixed(2)} `
+                + `targetDiff=${channel.sessionDifficulty} version=0x${submitVersion.toString(16)}`,
+            );
             await this.sendShareError(submission.channelId, submission.sequenceNumber, 'difficulty-too-low');
             await this.recordRejectedShare();
             return;
@@ -650,12 +663,18 @@ export class StratumV2Client {
             jobState.merklePath,
         );
 
-        const version = this.versionRollingEnabled
-            ? (submission.version >>> 0)
-            : (jobState.jobTemplate.block.version >>> 0);
+        const jobVersion = jobState.jobTemplate.block.version >>> 0;
+        const submitVersion = submission.version >>> 0;
+        // BIP320: only general-purpose bits may differ from the job version.
+        if (((submitVersion ^ jobVersion) & BIP320_CONSENSUS_VERSION_MASK) !== 0) {
+            await this.sendShareError(submission.channelId, submission.sequenceNumber, 'invalid-version');
+            await this.recordRejectedShare();
+            return;
+        }
 
         const header = Buffer.alloc(80);
-        header.writeUInt32LE(version, 0);
+        // Always hash with the version the miner actually used (ESP-Miner rolls BIP320 bits).
+        header.writeUInt32LE(submitVersion, 0);
         jobState.prevHash.copy(header, 4);
         merkleRoot.copy(header, 36);
         header.writeUInt32LE(submission.ntime >>> 0, 68);
@@ -669,6 +688,11 @@ export class StratumV2Client {
             || submissionDifficulty >= jobState.jobTemplate.blockData.networkDifficulty;
 
         if (!meetsJobTarget && !isBlockCandidate) {
+            console.warn(
+                `[SV2 ${this.sessionId}] difficulty-too-low `
+                + `job=${submission.jobId} shareDiff=${submissionDifficulty.toFixed(2)} `
+                + `targetDiff=${channel.sessionDifficulty} version=0x${submitVersion.toString(16)}`,
+            );
             await this.sendShareError(submission.channelId, submission.sequenceNumber, 'difficulty-too-low');
             await this.recordRejectedShare();
             return;
@@ -681,7 +705,7 @@ export class StratumV2Client {
                 submission,
                 merkleRoot,
                 channel.extranoncePrefix,
-                version,
+                submitVersion,
             );
             const blockHex = updatedJobBlock.toHex(false);
             const result = await this.bitcoinRpcService.SUBMIT_BLOCK(blockHex);
@@ -980,7 +1004,7 @@ export class StratumV2Client {
                 jobId,
                 minNtime: sendPrevHash ? null : jobTemplate.block.timestamp,
                 version: jobTemplate.block.version >>> 0,
-                versionRollingAllowed: this.versionRollingEnabled,
+                versionRollingAllowed: true,
                 merklePath,
                 coinbasePrefix,
                 coinbaseSuffix,
@@ -1119,6 +1143,22 @@ export class StratumV2Client {
         }
         await this.creatingEntity;
         void channel;
+    }
+
+    /** Mark worker online as soon as a mining channel is open (before first accept). */
+    private async heartbeatOnline(): Promise<void> {
+        if (this.entity == null || this.statistics == null) {
+            return;
+        }
+        const now = new Date();
+        await this.clientService.heartbeat(
+            this.entity.address,
+            this.entity.clientName,
+            this.entity.sessionId,
+            this.statistics.hashRate,
+            now,
+        );
+        this.entity.updatedAt = now;
     }
 
     private async recordRejectedShare(): Promise<void> {
