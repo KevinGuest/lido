@@ -37,6 +37,15 @@ $ npm run test:cov
 
 See sibling [`../lido-ui`](../lido-ui) (Lido Next.js dashboard). List-all workers: `GET /api/client`.
 
+## Stratum V2
+
+Optional dual-stack Mining Protocol listener (Noise + standard/extended channels) on
+`STRATUM_V2_PORT` (default `4444`). Enable with `ENABLE_STRATUM_V2=true`. Stratum V1 on
+`STRATUM_PORT` is unchanged. See `.env.example` for `SV2_AUTHORITY_PRIVKEY`,
+`SV2_START_DIFFICULTY`, and `SV2_TARGET_SHARES_PER_MINUTE`.
+
+Job Declaration / Template Distribution protocols are not included.
+
 ## Deployment
 
 Image: `ghcr.io/kevinguest/lido` (published by `.github/workflows/publish.yml`).
