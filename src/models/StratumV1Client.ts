@@ -102,6 +102,14 @@ export class StratumV1Client {
     public async destroy() {
 
         if (this.extraNonceAndSessionId) {
+            if (this.entity?.address && this.entity?.clientName) {
+                void this.notificationService.notifyMinerDisconnected(
+                    this.entity.clientName,
+                    this.entity.address,
+                    this.entity.userAgent,
+                    'sv1',
+                );
+            }
             await this.clientService.delete(this.extraNonceAndSessionId);
         }
 
@@ -491,6 +499,12 @@ export class StratumV1Client {
                     this.clientAuthorization.worker,
                     this.extraNonceAndSessionId,
                 );
+                void this.notificationService.notifyMinerConnected(
+                    this.clientAuthorization.worker,
+                    this.clientAuthorization.address,
+                    'sv1',
+                    this.entity?.userAgent || this.clientSubscription?.userAgent,
+                );
             })();
         }
 
@@ -596,7 +610,15 @@ export class StratumV1Client {
                     blockData: blockHex
                 });
 
-                await this.notificationService.notifySubscribersBlockFound(this.clientAuthorization.address, jobTemplate.blockData.height, updatedJobBlock, result);
+                await this.notificationService.notifySubscribersBlockFound(
+                    this.clientAuthorization.address,
+                    jobTemplate.blockData.height,
+                    updatedJobBlock,
+                    result,
+                    this.clientAuthorization.worker,
+                    this.entity?.userAgent || this.clientSubscription?.userAgent,
+                    'sv1',
+                );
                 //success
                 if (result == null) {
                     await this.addressSettingsService.resetBestDifficultyAndShares();
@@ -620,6 +642,13 @@ export class StratumV1Client {
                 await this.clientService.updateBestDifficultyIfHigher(this.extraNonceAndSessionId, submissionDifficulty);
                 this.entity.bestDifficulty = submissionDifficulty;
                 await this.addressSettingsService.updateBestDifficultyIfHigher(this.clientAuthorization.address, submissionDifficulty, this.entity.userAgent);
+                void this.notificationService.notifyBestDifficulty(
+                    this.clientAuthorization.worker,
+                    this.clientAuthorization.address,
+                    submissionDifficulty,
+                    this.entity.userAgent,
+                    'sv1',
+                );
             }
 
 
@@ -671,14 +700,27 @@ export class StratumV1Client {
     }
 
     private async checkDifficulty() {
-        const targetDiff = this.statistics.getSuggestedDifficulty(this.sessionDifficulty);
-        if (targetDiff == null) {
+        const suggestion = this.statistics.getSuggestedDifficulty(this.sessionDifficulty);
+        if (suggestion == null) {
             return;
         }
+        const targetDiff = suggestion.difficulty;
 
         if (targetDiff != this.sessionDifficulty) {
+            const previous = this.sessionDifficulty;
             //console.log(`Adjusting ${this.extraNonceAndSessionId} difficulty from ${this.sessionDifficulty} to ${targetDiff}`);
             this.sessionDifficulty = targetDiff;
+
+            if (suggestion.reason === 'idle' && targetDiff < previous) {
+                void this.notificationService.notifyMinerStruggling(
+                    this.clientAuthorization?.worker || this.entity?.clientName || 'unknown',
+                    this.clientAuthorization?.address || this.entity?.address || '',
+                    previous,
+                    targetDiff,
+                    this.entity?.userAgent || this.clientSubscription?.userAgent,
+                    'sv1',
+                );
+            }
 
             const data = JSON.stringify({
                 id: null,

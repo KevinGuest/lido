@@ -33,6 +33,16 @@ export class BlocksService {
         });
     }
 
+    public async countFoundBlocksSince(sinceMs: number): Promise<number> {
+        const blocks = await this.blocksRepository.find({
+            select: { id: true, createdAt: true },
+        });
+        return blocks.filter((block) => {
+            const created = block.createdAt ? new Date(block.createdAt).getTime() : 0;
+            return created >= sinceMs;
+        }).length;
+    }
+
     public async getFoundBlocksByAddress(address: string) {
         return await this.blocksRepository.find({
             select: {

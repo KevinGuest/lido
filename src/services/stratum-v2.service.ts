@@ -9,7 +9,7 @@ import { ClientStatisticsService } from '../ORM/client-statistics/client-statist
 import { ClientService } from '../ORM/client/client.service';
 import { StratumV2Client } from '../models/StratumV2Client';
 import { encodeSv2AuthorityPublicKey } from '../models/sv2/sv2-authority-key';
-import { resolveSv2AuthorityPrivKey } from '../models/sv2/sv2-authority-persist';
+import { resolveSv2AuthorityPrivKey, rotatePersistedSv2AuthorityPrivKey } from '../models/sv2/sv2-authority-persist';
 import {
     resolveSv2ProcessNamespace,
     Sv2ExtranonceManager,
@@ -43,7 +43,7 @@ export class StratumV2Service implements OnModuleInit, OnModuleDestroy {
     private readonly clients = new Set<StratumV2Client>();
     private authorityPrivKey: Buffer;
     private authorityPublicKeyXOnly: Buffer;
-    private authorityKeyConfigured = false;
+    private authorityKeySource: 'env' | 'persisted' | 'generated' = 'generated';
     private serverKeypair: Sv2ServerKeypair;
     private noiseConfig: Sv2NoiseConfig;
     private channelIdCounter = 1;
@@ -152,15 +152,60 @@ export class StratumV2Service implements OnModuleInit, OnModuleDestroy {
         publicKey: string;
         configured: boolean;
         enabled: boolean;
+        source: 'env' | 'persisted' | 'generated' | null;
+        rotatable: boolean;
     }> {
         if (!this.enabled) {
-            return { publicKey: '', configured: false, enabled: false };
+            return {
+                publicKey: '',
+                configured: false,
+                enabled: false,
+                source: null,
+                rotatable: false,
+            };
         }
         await this.ensureInitialized();
         return {
             publicKey: encodeSv2AuthorityPublicKey(this.authorityPublicKeyXOnly),
-            configured: this.authorityKeyConfigured,
+            // Env or on-disk key is stable across restarts / image updates.
+            configured: this.authorityKeySource === 'env' || this.authorityKeySource === 'persisted',
             enabled: true,
+            source: this.authorityKeySource,
+            // Env-pinned keys must be changed via SV2_AUTHORITY_PRIVKEY, not the UI.
+            rotatable: this.authorityKeySource !== 'env',
+        };
+    }
+
+    /**
+     * Generate a new authority key, persist it under DB/, refresh Noise certs,
+     * and drop connected SV2 clients so they re-handshake. Miners must be
+     * updated with the new public key.
+     */
+    public async rotatePoolAuthorityKey(): Promise<{
+        publicKey: string;
+        source: 'persisted';
+    }> {
+        if (!this.enabled) {
+            throw new Error('Stratum V2 is disabled');
+        }
+        await this.ensureInitialized();
+
+        if (this.authorityKeySource === 'env') {
+            throw new Error(
+                'Authority key is pinned by SV2_AUTHORITY_PRIVKEY; unset that env to rotate from the UI',
+            );
+        }
+
+        rotatePersistedSv2AuthorityPrivKey();
+        await this.initializeNoiseConfig();
+
+        const clients = Array.from(this.clients);
+        this.clients.clear();
+        await Promise.allSettled(clients.map(client => client.destroy()));
+
+        return {
+            publicKey: encodeSv2AuthorityPublicKey(this.authorityPublicKeyXOnly),
+            source: 'persisted',
         };
     }
 
@@ -240,15 +285,18 @@ export class StratumV2Service implements OnModuleInit, OnModuleDestroy {
         const configuredAuthorityKey = this.configService.get<string>('SV2_AUTHORITY_PRIVKEY');
         const resolved = resolveSv2AuthorityPrivKey(configuredAuthorityKey);
         this.authorityPrivKey = resolved.privKey;
-        this.authorityKeyConfigured = resolved.source === 'env';
+        this.authorityKeySource = resolved.source;
         this.authorityPublicKeyXOnly = xOnlyPubKeyFromPriv(this.authorityPrivKey);
 
-        if (resolved.source === 'generated') {
+        if (resolved.source === 'persisted') {
+            // First create vs reload both land as persisted once the file write succeeds.
+            console.log('Using persisted SV2 authority key (DB/sv2-authority.privkey)');
+        } else if (resolved.source === 'env') {
+            console.log('Using SV2 authority key from SV2_AUTHORITY_PRIVKEY');
+        } else {
             console.warn(
-                'SV2_AUTHORITY_PRIVKEY is not set; generated and persisted a stable SV2 authority key under DB/',
+                'SV2 authority key is ephemeral this run (could not write DB/sv2-authority.privkey)',
             );
-        } else if (resolved.source === 'persisted') {
-            console.log('Loaded persisted SV2 authority key from DB/sv2-authority.privkey');
         }
 
         this.serverKeypair = await generateServerKeypair();

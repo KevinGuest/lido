@@ -4,6 +4,8 @@ import * as path from 'path';
 
 const AUTHORITY_PRIVKEY_FILENAME = 'sv2-authority.privkey';
 
+export type Sv2AuthorityKeySource = 'env' | 'persisted' | 'generated';
+
 /** Trim, strip 0x, require 64 hex chars. */
 export function normalizeSv2AuthorityPrivKeyHex(raw: string | undefined | null): string | null {
   if (raw == null) return null;
@@ -21,16 +23,29 @@ export function authorityPrivKeyFilePath(dbDir = path.join(process.cwd(), 'DB'))
   return path.join(dbDir, AUTHORITY_PRIVKEY_FILENAME);
 }
 
+export function writeSv2AuthorityPrivKey(
+  privKey: Buffer,
+  dbDir = path.join(process.cwd(), 'DB'),
+): string {
+  if (privKey.length !== 32) {
+    throw new RangeError(`SV2 authority private key must be 32 bytes, got ${privKey.length}`);
+  }
+  const filePath = authorityPrivKeyFilePath(dbDir);
+  fs.mkdirSync(dbDir, { recursive: true });
+  fs.writeFileSync(filePath, privKey.toString('hex'), { encoding: 'utf8', mode: 0o600 });
+  return filePath;
+}
+
 /**
  * Resolve the pool authority private key:
  * 1. SV2_AUTHORITY_PRIVKEY env (if valid hex)
- * 2. Persisted file under DB/ (survives Umbrel restarts)
+ * 2. Persisted file under DB/ (survives Umbrel restarts / image updates)
  * 3. Generate + persist a new key
  */
 export function resolveSv2AuthorityPrivKey(
   configuredRaw: string | undefined | null,
   dbDir = path.join(process.cwd(), 'DB'),
-): { privKey: Buffer; source: 'env' | 'persisted' | 'generated' } {
+): { privKey: Buffer; source: Sv2AuthorityKeySource } {
   const fromEnv = normalizeSv2AuthorityPrivKeyHex(configuredRaw);
   if (fromEnv) {
     return { privKey: Buffer.from(fromEnv, 'hex'), source: 'env' };
@@ -52,8 +67,7 @@ export function resolveSv2AuthorityPrivKey(
 
   const generated = crypto.randomBytes(32);
   try {
-    fs.mkdirSync(dbDir, { recursive: true });
-    fs.writeFileSync(filePath, generated.toString('hex'), { encoding: 'utf8', mode: 0o600 });
+    writeSv2AuthorityPrivKey(generated, dbDir);
   } catch (error) {
     console.warn(
       `Failed to persist SV2 authority key (ephemeral this run): ${(error as Error).message}`,
@@ -61,5 +75,18 @@ export function resolveSv2AuthorityPrivKey(
     return { privKey: generated, source: 'generated' };
   }
 
-  return { privKey: generated, source: 'generated' };
+  // On disk now — same stability as a prior persist; log as newly generated in the service.
+  return { privKey: generated, source: 'persisted' };
+}
+
+/**
+ * Replace the on-disk authority key. Refuses when env pin is set (caller should check).
+ * Returns the new private key bytes.
+ */
+export function rotatePersistedSv2AuthorityPrivKey(
+  dbDir = path.join(process.cwd(), 'DB'),
+): Buffer {
+  const generated = crypto.randomBytes(32);
+  writeSv2AuthorityPrivKey(generated, dbDir);
+  return generated;
 }

@@ -1,6 +1,7 @@
+import { BadRequestException, Body, Controller, Get, Inject, Post, Query } from '@nestjs/common';
 import { CACHE_MANAGER } from '@nestjs/cache-manager';
-import { Controller, Get, Inject, Query } from '@nestjs/common';
 import { Cache } from 'cache-manager';
+import * as os from 'os';
 import { firstValueFrom } from 'rxjs';
 
 import { AddressSettingsService } from './ORM/address-settings/address-settings.service';
@@ -10,6 +11,27 @@ import { ClientService } from './ORM/client/client.service';
 import { PoolMetaService } from './ORM/pool-meta/pool-meta.service';
 import { BitcoinRpcService } from './services/bitcoin-rpc.service';
 import { StratumV2Service } from './services/stratum-v2.service';
+
+function platformLabel(): string {
+  switch (os.platform()) {
+    case 'win32':
+      return 'Windows';
+    case 'darwin':
+      return 'macOS';
+    case 'linux':
+      return 'Linux';
+    case 'freebsd':
+      return 'FreeBSD';
+    case 'openbsd':
+      return 'OpenBSD';
+    case 'sunos':
+      return 'Solaris';
+    case 'aix':
+      return 'AIX';
+    default:
+      return os.platform();
+  }
+}
 
 @Controller()
 export class AppController {
@@ -36,7 +58,32 @@ export class AppController {
       enabled: authority.enabled,
       authorityPublicKey: authority.publicKey,
       configured: authority.configured,
+      source: authority.source,
+      rotatable: authority.rotatable,
     };
+  }
+
+  /**
+   * Rotate the persisted SV2 authority key. Miners must be updated afterward.
+   * Body: { "confirm": "rotate" }
+   */
+  @Post('info/sv2/authority/rotate')
+  public async rotateSv2Authority(@Body() body: { confirm?: string }) {
+    if (body?.confirm !== 'rotate') {
+      throw new BadRequestException('Set confirm to "rotate" to rotate the authority key');
+    }
+    try {
+      const result = await this.stratumV2Service.rotatePoolAuthorityKey();
+      return {
+        enabled: true,
+        authorityPublicKey: result.publicKey,
+        configured: true,
+        source: result.source,
+        rotatable: true,
+      };
+    } catch (error) {
+      throw new BadRequestException((error as Error).message);
+    }
   }
 
   @Get('info')
@@ -55,6 +102,25 @@ export class AppController {
     const userAgents = await this.clientService.getUserAgents();
     const highScores = await this.addressSettingsService.getHighScores();
     const startedAt = await this.poolMetaService.getStartedAt();
+    const [shareTotals, rolledUp, overallUptimeSeconds, workers] = await Promise.all([
+      this.clientStatisticsService.getShareTotals(),
+      this.poolMetaService.getRolledUpShares(),
+      this.poolMetaService.getOverallUptimeSeconds(),
+      this.clientService.getAllActive(),
+    ]);
+
+    const highScoreBest = (highScores ?? []).reduce(
+      (max, row) => Math.max(max, Number(row.bestDifficulty) || 0),
+      0,
+    );
+    const workerBest = (workers ?? []).reduce(
+      (max, worker) => Math.max(max, Number(worker.bestDifficulty) || 0),
+      0,
+    );
+    const userAgentBest = (userAgents ?? []).reduce(
+      (max, row) => Math.max(max, Number(row.bestDifficulty) || 0),
+      0,
+    );
 
     const data = {
       blockData,
@@ -62,6 +128,12 @@ export class AppController {
       highScores,
       uptime: this.bootAt,
       startedAt,
+      platform: platformLabel(),
+      sharesAccepted: rolledUp.accepted + shareTotals.accepted,
+      sharesRejected: rolledUp.rejected + shareTotals.rejected,
+      bestDifficulty: Math.max(highScoreBest, workerBest, userAgentBest),
+      blocksFound: Array.isArray(blockData) ? blockData.length : 0,
+      overallUptimeSeconds,
     };
 
     // Near-live dashboard
@@ -126,11 +198,12 @@ export class AppController {
       const cached = await this.cacheManager.get(CACHE_KEY);
       if (cached != null) return cached;
 
-      const [userAgents, workers, shareCounts, highScores] = await Promise.all([
+      const [userAgents, workers, shareCounts, highScores, rolledUp] = await Promise.all([
         this.clientService.getUserAgents(),
         this.clientService.getAllActive(),
         this.clientStatisticsService.getAcceptedShareCounts(),
         this.addressSettingsService.getHighScores(),
+        this.poolMetaService.getRolledUpShares(),
       ]);
 
       const totalHashRate = userAgents.reduce(
@@ -150,7 +223,7 @@ export class AppController {
         0,
       );
       const bestDifficulty = Math.max(workerBest, highScoreBest);
-      let totalShares = 0;
+      let totalShares = rolledUp.accepted;
       for (const count of shareCounts.values()) {
         totalShares += count;
       }

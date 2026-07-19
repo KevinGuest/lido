@@ -141,12 +141,19 @@ export class StratumV1ClientStatistics {
         }
     }
 
-    public getSuggestedDifficulty(clientDifficulty: number) {
+    public getSuggestedDifficulty(clientDifficulty: number): {
+        difficulty: number;
+        reason: 'idle' | 'vardiff';
+    } | null {
 
-        // miner hasn't submitted shares in one minute
+        // miner hasn't submitted shares in one minute — difficulty is likely too high
         if (this.submissionCache.length < 5) {
             if ((new Date().getTime() - this.submissionCacheStart.getTime()) / 1000 > 60) {
-                return this.nearestPowerOfTwo(clientDifficulty / 6);
+                const difficulty = this.nearestPowerOfTwo(clientDifficulty / 6);
+                if (difficulty == null) {
+                    return null;
+                }
+                return { difficulty, reason: 'idle' };
             } else {
                 return null;
             }
@@ -163,7 +170,11 @@ export class StratumV1ClientStatistics {
         const targetDifficulty = difficultyPerSecond * TARGET_SUBMISSION_PER_SECOND;
 
         if ((clientDifficulty * 2) < targetDifficulty || (clientDifficulty / 2) > targetDifficulty) {
-            return this.nearestPowerOfTwo(targetDifficulty)
+            const difficulty = this.nearestPowerOfTwo(targetDifficulty);
+            if (difficulty == null) {
+                return null;
+            }
+            return { difficulty, reason: 'vardiff' };
         }
 
         return null;

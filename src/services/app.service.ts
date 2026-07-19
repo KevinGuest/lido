@@ -3,6 +3,7 @@ import { DataSource } from 'typeorm';
 
 import { ClientStatisticsService } from '../ORM/client-statistics/client-statistics.service';
 import { ClientService } from '../ORM/client/client.service';
+import { PoolMetaService } from '../ORM/pool-meta/pool-meta.service';
 import { RpcBlockService } from '../ORM/rpc-block/rpc-block.service';
 
 @Injectable()
@@ -13,6 +14,7 @@ export class AppService implements OnModuleInit {
         private readonly clientService: ClientService,
         private readonly dataSource: DataSource,
         private readonly rpcBlockService: RpcBlockService,
+        private readonly poolMetaService: PoolMetaService,
     ) {
 
     }
@@ -55,6 +57,12 @@ export class AppService implements OnModuleInit {
 
     private async deleteOldStatistics() {
         console.log('Deleting statistics');
+
+        const cutoffMs = Date.now() - 8 * 24 * 60 * 60 * 1000;
+        const retiring = await this.clientStatisticsService.getShareTotalsOlderThan(cutoffMs);
+        if (retiring.accepted > 0 || retiring.rejected > 0) {
+            await this.poolMetaService.addRolledUpShares(retiring.accepted, retiring.rejected);
+        }
 
         const deletedStatistics = await this.clientStatisticsService.deleteOldStatistics();
         console.log(`Deleted ${deletedStatistics.affected} old statistics`);

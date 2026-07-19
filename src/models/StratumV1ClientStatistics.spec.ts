@@ -122,7 +122,10 @@ describe('StratumV1ClientStatistics', () => {
     it('should lower difficulty when a miner has not submitted shares for several minutes', () => {
         jest.setSystemTime(new Date('2026-05-06T12:06:00Z'));
 
-        expect(statistics.getSuggestedDifficulty(64)).toBe(8);
+        expect(statistics.getSuggestedDifficulty(64)).toEqual({
+            difficulty: 8,
+            reason: 'idle',
+        });
     });
 
     it('should increase difficulty for rapid submissions', async () => {
@@ -131,7 +134,10 @@ describe('StratumV1ClientStatistics', () => {
             await statistics.addShares(client, 64);
         }
 
-        expect(statistics.getSuggestedDifficulty(64)).toBe(512);
+        expect(statistics.getSuggestedDifficulty(64)).toEqual({
+            difficulty: 512,
+            reason: 'vardiff',
+        });
     });
 
     it('should decrease difficulty for slow submissions', async () => {
@@ -140,6 +146,9 @@ describe('StratumV1ClientStatistics', () => {
             await statistics.addShares(client, 64);
         }
 
-        expect(statistics.getSuggestedDifficulty(128)).toBe(4);
+        expect(statistics.getSuggestedDifficulty(128)).toEqual({
+            difficulty: 4,
+            reason: 'vardiff',
+        });
     });
 });

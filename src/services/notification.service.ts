@@ -1,24 +1,198 @@
-import { Injectable, OnModuleInit } from '@nestjs/common';
 import { Block } from 'bitcoinjs-lib';
 
-import { DiscordService } from './discord.service';
+import { Injectable, OnModuleInit } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+
+import { DiscordService, NotificationMessage } from './discord.service';
+import { NotificationEventKey, NotificationSettingsService } from './notification-settings.service';
 import { TelegramService } from './telegram.service';
 
+const STRUGGLING_COOLDOWN_MS = 15 * 60 * 1000;
 
 @Injectable()
 export class NotificationService implements OnModuleInit {
+    private readonly strugglingLastSent = new Map<string, number>();
 
     constructor(
         private readonly telegramService: TelegramService,
-        private readonly discordService: DiscordService
-    ) { }
+        private readonly discordService: DiscordService,
+        private readonly notificationSettings: NotificationSettingsService,
+        private readonly configService: ConfigService,
+    ) {}
 
     async onModuleInit(): Promise<void> {
-        await this.discordService.notifyRestarted();
+        // Avoid spamming Discord on every restart; users can use Test instead.
     }
 
-    public async notifySubscribersBlockFound(address: string, height: number, block: Block, message: string) {
-        await this.discordService.notifySubscribersBlockFound(height, block, message);
-        await this.telegramService.notifySubscribersBlockFound(address, height, block, message);
+    public async notifySubscribersBlockFound(
+        address: string,
+        height: number,
+        block: Block,
+        message: string,
+        worker?: string,
+        device?: string,
+        protocol?: string,
+    ) {
+        let blockHash = '';
+        try {
+            blockHash = block.getId();
+        } catch {
+            blockHash = '';
+        }
+        const url = blockHash
+            ? mempoolBlockUrl(blockHash, this.configService.get<string>('NETWORK'))
+            : mempoolBlockHeightUrl(height, this.configService.get<string>('NETWORK'));
+
+        const payload: NotificationMessage = {
+            event: 'blockFound',
+            worker: worker || undefined,
+            device: device || undefined,
+            address,
+            protocol,
+            url,
+            action: `Candidate block submitted. Result: ${message}`,
+            fields: [
+                { name: 'Height', value: String(height), inline: true },
+                ...(blockHash
+                    ? [{ name: 'Block hash', value: blockHash, inline: false }]
+                    : []),
+            ],
+        };
+
+        if (this.notificationSettings.isChannelEventEnabled('discord', 'blockFound')) {
+            await this.discordService.send(payload);
+        }
+        if (this.notificationSettings.isChannelEventEnabled('telegram', 'blockFound')) {
+            await this.telegramService.notifySubscribersBlockFound(address, height, block, message);
+            await this.telegramService.send(payload);
+        }
     }
+
+    public async notifyMinerConnected(
+        worker: string,
+        address: string,
+        protocol: string,
+        device?: string,
+    ) {
+        await this.emit({
+            event: 'minerConnect',
+            worker,
+            address,
+            device,
+            protocol,
+            action: `${worker} opened a mining session.`,
+        });
+    }
+
+    public async notifyMinerDisconnected(
+        worker: string,
+        address: string,
+        device?: string,
+        protocol?: string,
+    ) {
+        await this.emit({
+            event: 'minerDisconnect',
+            worker,
+            address,
+            device,
+            protocol,
+            action: `${worker} went offline.`,
+        });
+    }
+
+    public async notifyBestDifficulty(
+        worker: string,
+        address: string,
+        difficulty: number,
+        device?: string,
+        protocol?: string,
+    ) {
+        await this.emit({
+            event: 'bestDifficulty',
+            worker,
+            address,
+            device,
+            protocol,
+            action: `${worker} set a new best difficulty.`,
+            fields: [
+                {
+                    name: 'Difficulty',
+                    value: difficulty.toLocaleString(),
+                    inline: true,
+                },
+            ],
+        });
+    }
+
+    /**
+     * Fired when vardiff lowers difficulty because the miner isn't submitting
+     * enough shares (difficulty likely too high for the device).
+     */
+    public async notifyMinerStruggling(
+        worker: string,
+        address: string,
+        fromDifficulty: number,
+        toDifficulty: number,
+        device?: string,
+        protocol?: string,
+    ) {
+        const key = `${address}\0${worker}\0${protocol || ''}`;
+        const last = this.strugglingLastSent.get(key) || 0;
+        if (Date.now() - last < STRUGGLING_COOLDOWN_MS) {
+            return;
+        }
+        this.strugglingLastSent.set(key, Date.now());
+
+        await this.emit({
+            event: 'minerStruggling',
+            worker,
+            address,
+            device,
+            protocol,
+            action: `${worker} isn't submitting enough shares — lowering stratum difficulty.`,
+            fields: [
+                {
+                    name: 'From',
+                    value: fromDifficulty.toLocaleString(),
+                    inline: true,
+                },
+                {
+                    name: 'To',
+                    value: toDifficulty.toLocaleString(),
+                    inline: true,
+                },
+            ],
+        });
+    }
+
+    private async emit(message: NotificationMessage & { event: NotificationEventKey }) {
+        if (this.notificationSettings.isChannelEventEnabled('discord', message.event)) {
+            await this.discordService.send(message);
+        }
+        if (this.notificationSettings.isChannelEventEnabled('telegram', message.event)) {
+            await this.telegramService.send(message);
+        }
+    }
+}
+
+export function mempoolBaseUrl(network?: string): string {
+    const n = (network || 'mainnet').toLowerCase();
+    if (n === 'testnet' || n === 'testnet3') {
+        return 'https://mempool.space/testnet';
+    }
+    if (n === 'testnet4') {
+        return 'https://mempool.space/testnet4';
+    }
+    if (n === 'signet') {
+        return 'https://mempool.space/signet';
+    }
+    return 'https://mempool.space';
+}
+
+export function mempoolBlockUrl(hash: string, network?: string): string {
+    return `${mempoolBaseUrl(network)}/block/${hash}`;
+}
+
+export function mempoolBlockHeightUrl(height: number, network?: string): string {
+    return `${mempoolBaseUrl(network)}/block-height/${height}`;
 }

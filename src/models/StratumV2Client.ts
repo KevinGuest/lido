@@ -164,6 +164,14 @@ export class StratumV2Client {
         this.channels.clear();
         this.stratumV2Service.unregisterClient(this);
         if (this.entity?.sessionId != null) {
+            if (this.entity.address && this.entity.clientName) {
+                void this.notificationService.notifyMinerDisconnected(
+                    this.entity.clientName,
+                    this.entity.address,
+                    this.entity.userAgent,
+                    'sv2',
+                );
+            }
             await this.clientService.delete(this.entity.sessionId);
         }
     }
@@ -567,6 +575,9 @@ export class StratumV2Client {
                 jobState.jobTemplate.blockData.height,
                 updatedJobBlock,
                 result,
+                this.workerName,
+                this.userAgent,
+                'sv2',
             );
             if (result == null) {
                 await this.addressSettingsService.resetBestDifficultyAndShares();
@@ -594,6 +605,13 @@ export class StratumV2Client {
                     this.address,
                     submissionDifficulty,
                     this.userAgent,
+                );
+                void this.notificationService.notifyBestDifficulty(
+                    this.workerName,
+                    this.address,
+                    submissionDifficulty,
+                    this.userAgent,
+                    'sv2',
                 );
             }
         } catch (error) {
@@ -721,6 +739,9 @@ export class StratumV2Client {
                 jobState.jobTemplate.blockData.height,
                 updatedJobBlock,
                 result,
+                this.workerName,
+                this.userAgent,
+                'sv2',
             );
             if (result == null) {
                 await this.addressSettingsService.resetBestDifficultyAndShares();
@@ -748,6 +769,13 @@ export class StratumV2Client {
                     this.address,
                     submissionDifficulty,
                     this.userAgent,
+                );
+                void this.notificationService.notifyBestDifficulty(
+                    this.workerName,
+                    this.address,
+                    submissionDifficulty,
+                    this.userAgent,
+                    'sv2',
                 );
             }
         } catch (error) {
@@ -1057,24 +1085,36 @@ export class StratumV2Client {
                 continue;
             }
 
-            const suggested = this.statistics.getSuggestedDifficulty(channel.sessionDifficulty);
-            if (suggested == null) {
+            const suggestion = this.statistics.getSuggestedDifficulty(channel.sessionDifficulty);
+            if (suggestion == null) {
                 continue;
             }
 
             const targetDiff = DifficultyUtils.clampDifficultyToMaxTarget(
-                suggested,
+                suggestion.difficulty,
                 channel.maxTarget,
             );
             if (targetDiff === channel.sessionDifficulty) {
                 continue;
             }
 
+            const previous = channel.sessionDifficulty;
             console.log(
                 `[SV2 ${this.sessionId}] Channel ${channel.channelId} difficulty `
                 + `${channel.sessionDifficulty} → ${targetDiff}`,
             );
             channel.sessionDifficulty = targetDiff;
+
+            if (suggestion.reason === 'idle' && targetDiff < previous) {
+                void this.notificationService.notifyMinerStruggling(
+                    this.workerName,
+                    this.address,
+                    previous,
+                    targetDiff,
+                    this.userAgent,
+                    'sv2',
+                );
+            }
 
             await this.sendFrame(
                 Sv2MsgType.SET_TARGET,
@@ -1138,6 +1178,12 @@ export class StratumV2Client {
                     this.address,
                     this.workerName,
                     this.sessionId,
+                );
+                void this.notificationService.notifyMinerConnected(
+                    this.workerName,
+                    this.address,
+                    'sv2',
+                    this.userAgent,
                 );
             })();
         }

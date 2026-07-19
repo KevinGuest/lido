@@ -38,6 +38,70 @@ export class ClientStatisticsService {
         await this.clientStatisticsRepository.insert(clientStatistic);
     }
 
+    public async getShareTotals(): Promise<{ accepted: number; rejected: number }> {
+        const rows: Array<{
+            accepted: string | number | null;
+            rejected: string | number | null;
+        }> = await this.clientStatisticsRepository.query(`
+            SELECT
+                SUM(acceptedCount) AS accepted,
+                SUM(COALESCE(rejectedCount, 0)) AS rejected
+            FROM client_statistics_entity
+        `);
+        return {
+            accepted: Number(rows?.[0]?.accepted) || 0,
+            rejected: Number(rows?.[0]?.rejected) || 0,
+        };
+    }
+
+    /** Share totals with time >= sinceMs (inclusive). */
+    public async getShareTotalsSince(sinceMs: number): Promise<{
+        accepted: number;
+        rejected: number;
+    }> {
+        const rows: Array<{
+            accepted: string | number | null;
+            rejected: string | number | null;
+        }> = await this.clientStatisticsRepository.query(
+            `
+            SELECT
+                SUM(acceptedCount) AS accepted,
+                SUM(COALESCE(rejectedCount, 0)) AS rejected
+            FROM client_statistics_entity
+            WHERE time >= ?
+            `,
+            [sinceMs],
+        );
+        return {
+            accepted: Number(rows?.[0]?.accepted) || 0,
+            rejected: Number(rows?.[0]?.rejected) || 0,
+        };
+    }
+
+    /** Sum share counts that will be removed by the retention prune. */
+    public async getShareTotalsOlderThan(cutoffMs: number): Promise<{
+        accepted: number;
+        rejected: number;
+    }> {
+        const rows: Array<{
+            accepted: string | number | null;
+            rejected: string | number | null;
+        }> = await this.clientStatisticsRepository.query(
+            `
+            SELECT
+                SUM(acceptedCount) AS accepted,
+                SUM(COALESCE(rejectedCount, 0)) AS rejected
+            FROM client_statistics_entity
+            WHERE time < ?
+            `,
+            [cutoffMs],
+        );
+        return {
+            accepted: Number(rows?.[0]?.accepted) || 0,
+            rejected: Number(rows?.[0]?.rejected) || 0,
+        };
+    }
+
     public async deleteOldStatistics() {
         // Keep a week (+ buffer) so 7d charts have history.
         const cutoff = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000);

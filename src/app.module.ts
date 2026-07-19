@@ -29,6 +29,13 @@ import { TelegramService } from './services/telegram.service';
 import { ExternalSharesService } from './services/external-shares.service';
 import { ExternalShareController } from './controllers/external-share/external-share.controller';
 import { ExternalSharesModule } from './ORM/external-shares/external-shares.module';
+import {
+    LogsController,
+    NotificationsController,
+} from './controllers/notifications.controller';
+import { NotificationSettingsService } from './services/notification-settings.service';
+import { PoolDigestService } from './services/pool-digest.service';
+import { PoolLogService } from './services/pool-log.service';
 
 const ORMModules = [
     ClientStatisticsModule,
@@ -63,7 +70,9 @@ const ORMModules = [
         AppController,
         ClientController,
         AddressController,
-        ExternalShareController
+        ExternalShareController,
+        NotificationsController,
+        LogsController,
     ],
     providers: [
         DiscordService,
@@ -73,6 +82,9 @@ const ORMModules = [
         TelegramService,
         BitcoinRpcService,
         NotificationService,
+        NotificationSettingsService,
+        PoolDigestService,
+        PoolLogService,
         BitcoinAddressValidator,
         StratumV1JobsService,
         BTCPayService,
