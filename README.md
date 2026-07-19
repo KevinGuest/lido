@@ -46,7 +46,8 @@ Optional dual-stack Mining Protocol listener (Noise + standard/extended channels
 
 Miners need the pool authority public key for Noise auth. Lido exposes it at
 `GET /api/info/sv2` (`authorityPublicKey`) and shows it in the Connect dialog’s SV2 tab.
-Set a fixed `SV2_AUTHORITY_PRIVKEY` so the key survives restarts.
+If `SV2_AUTHORITY_PRIVKEY` is unset, a key is generated and persisted under
+`DB/sv2-authority.privkey` so the pubkey survives restarts.
 
 Job Declaration / Template Distribution protocols are not included.
 

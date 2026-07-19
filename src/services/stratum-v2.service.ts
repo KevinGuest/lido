@@ -1,6 +1,5 @@
 import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import * as crypto from 'crypto';
 import { Server, Socket } from 'net';
 import { Subscription } from 'rxjs';
 
@@ -10,6 +9,7 @@ import { ClientStatisticsService } from '../ORM/client-statistics/client-statist
 import { ClientService } from '../ORM/client/client.service';
 import { StratumV2Client } from '../models/StratumV2Client';
 import { encodeSv2AuthorityPublicKey } from '../models/sv2/sv2-authority-key';
+import { resolveSv2AuthorityPrivKey } from '../models/sv2/sv2-authority-persist';
 import {
     resolveSv2ProcessNamespace,
     Sv2ExtranonceManager,
@@ -238,25 +238,30 @@ export class StratumV2Service implements OnModuleInit, OnModuleDestroy {
 
     private async initializeNoiseConfig(): Promise<void> {
         const configuredAuthorityKey = this.configService.get<string>('SV2_AUTHORITY_PRIVKEY');
-        this.authorityKeyConfigured = configuredAuthorityKey?.length === 64;
-        this.authorityPrivKey = configuredAuthorityKey?.length === 64
-            ? Buffer.from(configuredAuthorityKey, 'hex')
-            : crypto.randomBytes(32);
+        const resolved = resolveSv2AuthorityPrivKey(configuredAuthorityKey);
+        this.authorityPrivKey = resolved.privKey;
+        this.authorityKeyConfigured = resolved.source === 'env';
         this.authorityPublicKeyXOnly = xOnlyPubKeyFromPriv(this.authorityPrivKey);
 
-        if (!this.authorityKeyConfigured) {
-            console.warn('SV2_AUTHORITY_PRIVKEY is not set; generated an ephemeral SV2 authority key');
+        if (resolved.source === 'generated') {
+            console.warn(
+                'SV2_AUTHORITY_PRIVKEY is not set; generated and persisted a stable SV2 authority key under DB/',
+            );
+        } else if (resolved.source === 'persisted') {
+            console.log('Loaded persisted SV2 authority key from DB/sv2-authority.privkey');
         }
 
         this.serverKeypair = await generateServerKeypair();
+        // Long-lived cert: a 24h window caused miners to fail after ~1 day of pool uptime.
         const now = Math.floor(Date.now() / 1000);
+        const certTtlSec = 10 * 365 * 24 * 60 * 60;
         this.noiseConfig = {
             staticKeypair: this.serverKeypair,
             certificateMessage: createSignatureNoiseMessage(
                 this.authorityPrivKey,
                 xOnlyPubKeyFromPriv(this.serverKeypair.privateKey),
                 now - 3600,
-                now + 86400,
+                now + certTtlSec,
             ),
         };
 
