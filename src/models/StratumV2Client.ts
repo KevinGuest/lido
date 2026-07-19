@@ -107,7 +107,7 @@ export class StratumV2Client {
     private processingHandshake = false;
     private destroyed = false;
     private pendingSocketWriteBytes = 0;
-    private userAgent = 'unknown/sv2';
+    private userAgent = 'unknown';
     private versionRollingEnabled = false;
     private address: string = null;
     private workerName = 'default';
@@ -275,7 +275,10 @@ export class StratumV2Client {
 
     private async handleSetupConnection(payload: Buffer): Promise<void> {
         const message = deserializeSetupConnection(new BufferReader(payload));
-        this.userAgent = `${message.vendor || 'unknown'}/sv2`;
+        const vendor = (message.vendor || '').trim();
+        const hardware = (message.hardwareVersion || '').trim();
+        const firmware = (message.firmwareVersion || '').trim();
+        this.userAgent = vendor || hardware || firmware || 'unknown';
 
         if (message.protocol !== Sv2Protocol.MINING) {
             await this.sendFrame(
