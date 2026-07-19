@@ -144,11 +144,23 @@ export class StratumV2Service implements OnModuleInit, OnModuleDestroy {
         return this.noiseConfig;
     }
 
-    public async getPoolAuthorityPublicKey(): Promise<{ publicKey: string; configured: boolean }> {
+    public isSv2Enabled(): boolean {
+        return this.enabled;
+    }
+
+    public async getPoolAuthorityPublicKey(): Promise<{
+        publicKey: string;
+        configured: boolean;
+        enabled: boolean;
+    }> {
+        if (!this.enabled) {
+            return { publicKey: '', configured: false, enabled: false };
+        }
         await this.ensureInitialized();
         return {
             publicKey: encodeSv2AuthorityPublicKey(this.authorityPublicKeyXOnly),
             configured: this.authorityKeyConfigured,
+            enabled: true,
         };
     }
 

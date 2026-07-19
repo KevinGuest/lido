@@ -44,6 +44,10 @@ Optional dual-stack Mining Protocol listener (Noise + standard/extended channels
 `STRATUM_PORT` is unchanged. See `.env.example` for `SV2_AUTHORITY_PRIVKEY`,
 `SV2_START_DIFFICULTY`, and `SV2_TARGET_SHARES_PER_MINUTE`.
 
+Miners need the pool authority public key for Noise auth. Lido exposes it at
+`GET /api/info/sv2` (`authorityPublicKey`) and shows it in the Connect dialog’s SV2 tab.
+Set a fixed `SV2_AUTHORITY_PRIVKEY` so the key survives restarts.
+
 Job Declaration / Template Distribution protocols are not included.
 
 ## Deployment

@@ -15,7 +15,7 @@ permissions:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: lido
-  IMAGE_TAG: "0.1.9"
+  IMAGE_TAG: "0.1.10"
 
 jobs:
   build:

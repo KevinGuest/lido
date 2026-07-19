@@ -9,6 +9,7 @@ import { ClientStatisticsService } from './ORM/client-statistics/client-statisti
 import { ClientService } from './ORM/client/client.service';
 import { PoolMetaService } from './ORM/pool-meta/pool-meta.service';
 import { BitcoinRpcService } from './services/bitcoin-rpc.service';
+import { StratumV2Service } from './services/stratum-v2.service';
 
 @Controller()
 export class AppController {
@@ -24,7 +25,19 @@ export class AppController {
     private readonly bitcoinRpcService: BitcoinRpcService,
     private readonly addressSettingsService: AddressSettingsService,
     private readonly poolMetaService: PoolMetaService,
+    private readonly stratumV2Service: StratumV2Service,
   ) { }
+
+  /** Live SV2 authority pubkey for miner connect UI. Not cached — key is process-local. */
+  @Get('info/sv2')
+  public async sv2Info() {
+    const authority = await this.stratumV2Service.getPoolAuthorityPublicKey();
+    return {
+      enabled: authority.enabled,
+      authorityPublicKey: authority.publicKey,
+      configured: authority.configured,
+    };
+  }
 
   @Get('info')
   public async info() {
