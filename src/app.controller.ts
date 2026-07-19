@@ -176,7 +176,11 @@ export class AppController {
   @Get('network')
   public async network() {
     const miningInfo = await firstValueFrom(this.bitcoinRpcService.newBlock$);
-    return miningInfo;
+    // UI expects `height`; bitcoind getmininginfo uses `blocks`.
+    return {
+      ...miningInfo,
+      height: miningInfo?.blocks,
+    };
   }
 
   /** Umbrel home-screen widget: Hashrate, Workers, Best Difficulty, Total Shares */

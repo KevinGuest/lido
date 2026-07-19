@@ -81,10 +81,14 @@ export class LogsController {
 
     @Get('stream')
     stream(@Res() res: Response): void {
-        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
         res.setHeader('Cache-Control', 'no-cache, no-transform');
         res.setHeader('Connection', 'keep-alive');
+        res.setHeader('X-Accel-Buffering', 'no');
         res.flushHeaders?.();
+
+        // Comment ping keeps intermediaries from closing idle streams.
+        res.write(`: connected\n\n`);
 
         const sub = this.poolLogService.stream$().subscribe((line) => {
             res.write(`data: ${JSON.stringify(line)}\n\n`);
