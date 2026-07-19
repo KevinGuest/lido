@@ -481,6 +481,7 @@ export class StratumV1Client {
                     address: this.clientAuthorization.address,
                     clientName: this.clientAuthorization.worker,
                     userAgent: this.clientSubscription.userAgent,
+                    protocol: 'sv1',
                     startTime: new Date(),
                     bestDifficulty: 0
                 });

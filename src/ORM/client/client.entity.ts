@@ -26,7 +26,9 @@ export class ClientEntity extends TrackedEntity {
     @Column({ length: 128, type: 'varchar', nullable: true })
     userAgent: string;
 
-
+    /** Stratum protocol for this session: sv1 or sv2. */
+    @Column({ length: 8, type: 'varchar', default: 'sv1' })
+    protocol: string;
 
     @Column({ type: 'datetime', transformer: new DateTimeTransformer() })
     startTime: Date;

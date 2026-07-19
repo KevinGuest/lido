@@ -1103,6 +1103,7 @@ export class StratumV2Client {
                     address: this.address,
                     clientName: this.workerName,
                     userAgent: this.userAgent,
+                    protocol: 'sv2',
                     startTime: new Date(),
                     bestDifficulty: 0,
                 });

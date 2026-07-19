@@ -28,6 +28,7 @@ export class ClientController {
                 sessionId: worker.sessionId,
                 name: worker.clientName,
                 userAgent: worker.userAgent,
+                protocol: worker.protocol === 'sv2' ? 'sv2' : 'sv1',
                 bestDifficulty: Number(worker.bestDifficulty),
                 hashRate: worker.hashRate,
                 startTime: worker.startTime,
