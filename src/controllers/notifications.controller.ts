@@ -1,5 +1,5 @@
 import { BadRequestException, Body, Controller, Get, Post, Put, Query, Res } from '@nestjs/common';
-import { Response } from 'express';
+import { FastifyReply } from 'fastify';
 
 import { DiscordService, NotificationAvatarTheme } from '../services/discord.service';
 import { notificationConnectionTest } from '../services/notification-samples';
@@ -79,15 +79,18 @@ export class LogsController {
         return { lines: this.poolLogService.recent(Number.isFinite(limit) ? limit : 200) };
     }
 
+    /**
+     * SSE over Fastify — use the Node raw response, not Express `Response`.
+     */
     @Get('stream')
-    stream(@Res() res: Response): void {
-        res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-        res.setHeader('Cache-Control', 'no-cache, no-transform');
-        res.setHeader('Connection', 'keep-alive');
-        res.setHeader('X-Accel-Buffering', 'no');
-        res.flushHeaders?.();
-
-        // Comment ping keeps intermediaries from closing idle streams.
+    stream(@Res() reply: FastifyReply): void {
+        const res = reply.raw;
+        res.writeHead(200, {
+            'Content-Type': 'text/event-stream; charset=utf-8',
+            'Cache-Control': 'no-cache, no-transform',
+            Connection: 'keep-alive',
+            'X-Accel-Buffering': 'no',
+        });
         res.write(`: connected\n\n`);
 
         const sub = this.poolLogService.stream$().subscribe((line) => {
