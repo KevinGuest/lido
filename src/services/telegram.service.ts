@@ -5,7 +5,11 @@ import { validate } from 'bitcoin-address-validation';
 import { Block } from 'bitcoinjs-lib';
 
 import { NotificationMessage, formatEventTitle } from './discord.service';
-import { NotificationSettingsService } from './notification-settings.service';
+import {
+    NotificationSettingsService,
+    assertTelegramBotToken,
+    assertTelegramChatId,
+} from './notification-settings.service';
 import { TelegramSubscriptionsService } from '../ORM/telegram-subscriptions/telegram-subscriptions.service';
 
 @Injectable()
@@ -98,6 +102,15 @@ export class TelegramService implements OnModuleInit {
         }
         if (!target) {
             return { ok: false, error: 'Telegram chat ID is missing' };
+        }
+        try {
+            assertTelegramBotToken(token);
+            assertTelegramChatId(target);
+        } catch (error) {
+            return {
+                ok: false,
+                error: error instanceof Error ? error.message : 'Telegram credentials are invalid',
+            };
         }
 
         try {
@@ -207,20 +220,18 @@ export class TelegramService implements OnModuleInit {
             );
             return;
         }
-
-        console.log(msg);
     }
 
     private async sendRaw(chatId: number | string, text: string, token?: string) {
-        const resolvedToken = (
-            token ||
-            this.notificationSettings.getRaw().telegram.botToken ||
-            this.configService.get<string>('TELEGRAM_BOT_TOKEN') ||
-            ''
-        ).trim();
-        if (!resolvedToken) {
-            throw new Error('Telegram client is not configured');
-        }
+        const resolvedToken = assertTelegramBotToken(
+            (
+                token ||
+                this.notificationSettings.getRaw().telegram.botToken ||
+                this.configService.get<string>('TELEGRAM_BOT_TOKEN') ||
+                ''
+            ).trim(),
+        );
+        assertTelegramChatId(String(chatId));
 
         const client = axios.create({
             baseURL: `https://api.telegram.org/bot${resolvedToken}/`,

@@ -1,4 +1,4 @@
-import { Injectable, OnModuleInit } from '@nestjs/common';
+import { BadRequestException, Injectable, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -39,12 +39,14 @@ export interface NotificationSettingsFile {
     };
 }
 
+/** Wire format — secrets are never echoed back (only configured flags). */
 export interface NotificationSettingsPublic {
     enabled: boolean;
     locked: boolean;
     discord: {
         enabled: boolean;
         configured: boolean;
+        /** Empty on read. Send a new URL to replace; omit/empty/masked to keep. */
         webhookUrl: string;
         events: NotificationEvents;
         poolDigest: PoolDigestConfig;
@@ -68,6 +70,13 @@ const UNIT_MS: Record<Exclude<PoolDigestUnit, 'off'>, number> = {
     weeks: 7 * 24 * 60 * 60 * 1000,
     months: 30 * 24 * 60 * 60 * 1000,
 };
+
+const DISCORD_WEBHOOK_HOSTS = new Set([
+    'discord.com',
+    'discordapp.com',
+    'canary.discord.com',
+    'ptb.discord.com',
+]);
 
 export function poolDigestIntervalMs(digest: PoolDigestConfig): number {
     if (!digest || digest.unit === 'off') {
@@ -125,7 +134,6 @@ export function formatPoolDigestPeriod(digest: PoolDigestConfig): {
     };
 }
 
-
 function defaultEvents(): NotificationEvents {
     return {
         minerConnect: true,
@@ -158,7 +166,6 @@ function normalizeEvents(raw: unknown, fallback: NotificationEvents): Notificati
 }
 
 function normalizeDigest(raw: unknown, fallback: PoolDigestConfig = defaultPoolDigest()): PoolDigestConfig {
-    // Legacy string frequencies from the first digest UI.
     if (typeof raw === 'string') {
         switch (raw) {
             case 'off':
@@ -190,14 +197,47 @@ function normalizeDigest(raw: unknown, fallback: PoolDigestConfig = defaultPoolD
     return { ...fallback };
 }
 
-function maskSecret(value: string): string {
-    if (!value) return '';
-    if (value.length <= 8) return '••••••••';
-    return `${'•'.repeat(Math.min(24, value.length - 4))}${value.slice(-4)}`;
-}
-
 function looksMasked(value: string): boolean {
     return !value || /^[•.]+/.test(value) || value.includes('••••');
+}
+
+/** Must be a real Discord incoming-webhook URL. */
+export function assertDiscordWebhookUrl(url: string): string {
+    const trimmed = url.trim();
+    let parsed: URL;
+    try {
+        parsed = new URL(trimmed);
+    } catch {
+        throw new BadRequestException('Discord webhook URL is invalid');
+    }
+    if (parsed.protocol !== 'https:') {
+        throw new BadRequestException('Discord webhook must use https');
+    }
+    if (!DISCORD_WEBHOOK_HOSTS.has(parsed.hostname.toLowerCase())) {
+        throw new BadRequestException('Discord webhook must be a discord.com URL');
+    }
+    if (!parsed.pathname.startsWith('/api/webhooks/')) {
+        throw new BadRequestException('Discord webhook path looks wrong');
+    }
+    return trimmed;
+}
+
+/** BotFather tokens look like 123456:AA… — blocks URL injection into api.telegram.org. */
+export function assertTelegramBotToken(token: string): string {
+    const trimmed = token.trim();
+    if (!/^\d{6,}:[A-Za-z0-9_-]{20,}$/.test(trimmed)) {
+        throw new BadRequestException('Telegram bot token format is invalid');
+    }
+    return trimmed;
+}
+
+export function assertTelegramChatId(chatId: string): string {
+    const trimmed = chatId.trim();
+    // Numeric chats / groups, or @channel usernames.
+    if (!/^(-?\d{5,}|@[A-Za-z0-9_]{4,})$/.test(trimmed)) {
+        throw new BadRequestException('Telegram chat ID format is invalid');
+    }
+    return trimmed;
 }
 
 @Injectable()
@@ -222,15 +262,15 @@ export class NotificationSettingsService implements OnModuleInit {
             discord: {
                 enabled: s.discord.enabled,
                 configured: Boolean(s.discord.webhookUrl),
-                webhookUrl: maskSecret(s.discord.webhookUrl),
+                webhookUrl: '',
                 events: { ...s.discord.events },
                 poolDigest: s.discord.poolDigest,
             },
             telegram: {
                 enabled: s.telegram.enabled,
                 configured: Boolean(s.telegram.botToken && s.telegram.chatId),
-                botToken: maskSecret(s.telegram.botToken),
-                chatId: s.telegram.chatId,
+                botToken: '',
+                chatId: '',
                 events: { ...s.telegram.events },
                 poolDigest: s.telegram.poolDigest,
             },
@@ -258,13 +298,24 @@ export class NotificationSettingsService implements OnModuleInit {
     }
 
     public update(input: NotificationSettingsPublic): NotificationSettingsPublic {
+        const nextDiscordUrl = this.resolveDiscordWebhook(input.discord?.webhookUrl);
+        const nextTelegramToken = this.resolveTelegramToken(input.telegram?.botToken);
+        const nextTelegramChat = this.resolveTelegramChatId(input.telegram?.chatId);
+
+        if (input.discord?.enabled && !nextDiscordUrl) {
+            throw new BadRequestException('Discord webhook URL is required when Discord is enabled');
+        }
+        if (input.telegram?.enabled && (!nextTelegramToken || !nextTelegramChat)) {
+            throw new BadRequestException(
+                'Telegram bot token and chat ID are required when Telegram is enabled',
+            );
+        }
+
         const next: NotificationSettingsFile = {
             enabled: Boolean(input.enabled),
             discord: {
                 enabled: Boolean(input.discord?.enabled),
-                webhookUrl: looksMasked(input.discord?.webhookUrl)
-                    ? this.settings.discord.webhookUrl
-                    : String(input.discord?.webhookUrl || '').trim(),
+                webhookUrl: nextDiscordUrl,
                 events: normalizeEvents(input.discord?.events, this.settings.discord.events),
                 poolDigest: normalizeDigest(
                     input.discord?.poolDigest,
@@ -274,10 +325,8 @@ export class NotificationSettingsService implements OnModuleInit {
             },
             telegram: {
                 enabled: Boolean(input.telegram?.enabled),
-                botToken: looksMasked(input.telegram?.botToken)
-                    ? this.settings.telegram.botToken
-                    : String(input.telegram?.botToken || '').trim(),
-                chatId: String(input.telegram?.chatId || '').trim(),
+                botToken: nextTelegramToken,
+                chatId: nextTelegramChat,
                 events: normalizeEvents(input.telegram?.events, this.settings.telegram.events),
                 poolDigest: normalizeDigest(
                     input.telegram?.poolDigest,
@@ -289,6 +338,30 @@ export class NotificationSettingsService implements OnModuleInit {
         this.settings = next;
         this.persist();
         return this.getPublic();
+    }
+
+    private resolveDiscordWebhook(incomingRaw: string | undefined): string {
+        const incoming = String(incomingRaw || '').trim();
+        if (!incoming || looksMasked(incoming)) {
+            return this.settings.discord.webhookUrl;
+        }
+        return assertDiscordWebhookUrl(incoming);
+    }
+
+    private resolveTelegramToken(incomingRaw: string | undefined): string {
+        const incoming = String(incomingRaw || '').trim();
+        if (!incoming || looksMasked(incoming)) {
+            return this.settings.telegram.botToken;
+        }
+        return assertTelegramBotToken(incoming);
+    }
+
+    private resolveTelegramChatId(incomingRaw: string | undefined): string {
+        const incoming = String(incomingRaw || '').trim();
+        if (!incoming || looksMasked(incoming)) {
+            return this.settings.telegram.chatId;
+        }
+        return assertTelegramChatId(incoming);
     }
 
     private defaultFromEnv(): NotificationSettingsFile {

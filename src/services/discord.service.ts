@@ -5,6 +5,7 @@ import axios from 'axios';
 import {
     NotificationEventKey,
     NotificationSettingsService,
+    assertDiscordWebhookUrl,
 } from './notification-settings.service';
 
 export type NotificationAvatarTheme = 'dark' | 'light';
@@ -85,6 +86,14 @@ export class DiscordService {
         if (!url) {
             return { ok: false, error: 'Discord webhook URL is missing' };
         }
+        try {
+            assertDiscordWebhookUrl(url);
+        } catch (error) {
+            return {
+                ok: false,
+                error: error instanceof Error ? error.message : 'Discord webhook URL is invalid',
+            };
+        }
         if (!messages.length) {
             return { ok: false, error: 'No messages to send' };
         }
@@ -104,13 +113,16 @@ export class DiscordService {
             });
             return { ok: true };
         } catch (error) {
-            const err = error as { response?: { data?: unknown }; message?: string };
-            const detail =
-                typeof err.response?.data === 'string'
-                    ? err.response.data
-                    : err.message || 'Discord webhook failed';
+            const err = error as {
+                response?: { status?: number; data?: unknown };
+                message?: string;
+            };
+            const detail = formatDiscordWebhookError(
+                err.response?.data ?? err.message,
+                err.response?.status,
+            );
             console.error(`Discord webhook failed: ${detail}`);
-            return { ok: false, error: String(detail).slice(0, 240) };
+            return { ok: false, error: detail };
         }
     }
 
@@ -192,6 +204,55 @@ export class DiscordService {
             this.configService.get<string>('DISCORD_AVATAR_URL_DARK') || DEFAULT_AVATAR_DARK
         );
     }
+}
+
+/** Turn Discord API JSON / status into short UI copy. */
+export function formatDiscordWebhookError(raw: unknown, status?: number): string {
+    let message = '';
+    let code: number | undefined;
+
+    if (typeof raw === 'string' && raw.trim()) {
+        try {
+            const parsed = JSON.parse(raw) as { message?: unknown; code?: unknown };
+            if (typeof parsed.message === 'string') {
+                message = parsed.message;
+            }
+            if (typeof parsed.code === 'number') {
+                code = parsed.code;
+            } else if (!message) {
+                message = raw.trim();
+            }
+        } catch {
+            message = raw.trim();
+        }
+    } else if (raw && typeof raw === 'object') {
+        const obj = raw as { message?: unknown; code?: unknown };
+        if (typeof obj.message === 'string') {
+            message = obj.message;
+        }
+        if (typeof obj.code === 'number') {
+            code = obj.code;
+        }
+    }
+
+    if (code === 10015 || /unknown webhook/i.test(message)) {
+        return 'That Discord webhook was deleted or is invalid. Create a new one and paste it here.';
+    }
+    if (code === 50027 || /invalid webhook token/i.test(message)) {
+        return 'That Discord webhook token is invalid. Create a new webhook and paste the full URL.';
+    }
+    if (status === 401 || status === 403 || /unauthorized|forbidden/i.test(message)) {
+        return 'Discord rejected this webhook. Check the URL or create a new one.';
+    }
+    if (status === 404) {
+        return 'Discord webhook not found. It may have been deleted — create a new one.';
+    }
+    if (message && !message.trim().startsWith('{')) {
+        return message.length > 160 ? `${message.slice(0, 157)}…` : message;
+    }
+    return status
+        ? `Discord webhook test failed (${status})`
+        : 'Discord webhook test failed';
 }
 
 export function formatEventTitle(
