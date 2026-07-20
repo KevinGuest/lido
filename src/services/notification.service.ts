@@ -117,7 +117,7 @@ export class NotificationService implements OnModuleInit {
             fields: [
                 {
                     name: 'Difficulty',
-                    value: difficulty.toLocaleString(),
+                    value: formatCompactNumber(difficulty),
                     inline: true,
                 },
             ],
@@ -153,12 +153,12 @@ export class NotificationService implements OnModuleInit {
             fields: [
                 {
                     name: 'From',
-                    value: fromDifficulty.toLocaleString(),
+                    value: formatCompactNumber(fromDifficulty),
                     inline: true,
                 },
                 {
                     name: 'To',
-                    value: toDifficulty.toLocaleString(),
+                    value: formatCompactNumber(toDifficulty),
                     inline: true,
                 },
             ],
@@ -195,4 +195,13 @@ export function mempoolBlockUrl(hash: string, network?: string): string {
 
 export function mempoolBlockHeightUrl(height: number, network?: string): string {
     return `${mempoolBaseUrl(network)}/block-height/${height}`;
+}
+
+/** Match dashboard numberSuffix (e.g. 100233.211 → 100.23K, 4.2e12 → 4.20T). */
+function formatCompactNumber(value: number): string {
+    if (!Number.isFinite(value) || value <= 0) return '0';
+    const units = ['', 'K', 'M', 'G', 'T', 'P', 'E'];
+    const power = Math.min(units.length - 1, Math.floor(Math.log10(value) / 3));
+    const scaled = value / Math.pow(1000, Math.max(0, power));
+    return `${scaled.toFixed(2)}${units[Math.max(0, power)]}`;
 }

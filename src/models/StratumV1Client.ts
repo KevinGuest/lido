@@ -641,14 +641,21 @@ export class StratumV1Client {
             if (submissionDifficulty > this.entity.bestDifficulty) {
                 await this.clientService.updateBestDifficultyIfHigher(this.extraNonceAndSessionId, submissionDifficulty);
                 this.entity.bestDifficulty = submissionDifficulty;
-                await this.addressSettingsService.updateBestDifficultyIfHigher(this.clientAuthorization.address, submissionDifficulty, this.entity.userAgent);
-                void this.notificationService.notifyBestDifficulty(
-                    this.clientAuthorization.worker,
+                // Only notify on address all-time highs — session resets on reconnect / SV1↔SV2.
+                const addressBest = await this.addressSettingsService.updateBestDifficultyIfHigher(
                     this.clientAuthorization.address,
                     submissionDifficulty,
                     this.entity.userAgent,
-                    'sv1',
                 );
+                if ((addressBest?.affected ?? 0) > 0) {
+                    void this.notificationService.notifyBestDifficulty(
+                        this.clientAuthorization.worker,
+                        this.clientAuthorization.address,
+                        submissionDifficulty,
+                        this.entity.userAgent,
+                        'sv1',
+                    );
+                }
             }
 
 

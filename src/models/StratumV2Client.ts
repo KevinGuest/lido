@@ -601,18 +601,21 @@ export class StratumV2Client {
             if (submissionDifficulty > this.entity.bestDifficulty) {
                 await this.clientService.updateBestDifficultyIfHigher(this.sessionId, submissionDifficulty);
                 this.entity.bestDifficulty = submissionDifficulty;
-                await this.addressSettingsService.updateBestDifficultyIfHigher(
+                // Only notify on address all-time highs — session resets on reconnect / SV1↔SV2.
+                const addressBest = await this.addressSettingsService.updateBestDifficultyIfHigher(
                     this.address,
                     submissionDifficulty,
                     this.userAgent,
                 );
-                void this.notificationService.notifyBestDifficulty(
-                    this.workerName,
-                    this.address,
-                    submissionDifficulty,
-                    this.userAgent,
-                    'sv2',
-                );
+                if ((addressBest?.affected ?? 0) > 0) {
+                    void this.notificationService.notifyBestDifficulty(
+                        this.workerName,
+                        this.address,
+                        submissionDifficulty,
+                        this.userAgent,
+                        'sv2',
+                    );
+                }
             }
         } catch (error) {
             console.log(error);
@@ -765,18 +768,21 @@ export class StratumV2Client {
             if (submissionDifficulty > this.entity.bestDifficulty) {
                 await this.clientService.updateBestDifficultyIfHigher(this.sessionId, submissionDifficulty);
                 this.entity.bestDifficulty = submissionDifficulty;
-                await this.addressSettingsService.updateBestDifficultyIfHigher(
+                // Only notify on address all-time highs — session resets on reconnect / SV1↔SV2.
+                const addressBest = await this.addressSettingsService.updateBestDifficultyIfHigher(
                     this.address,
                     submissionDifficulty,
                     this.userAgent,
                 );
-                void this.notificationService.notifyBestDifficulty(
-                    this.workerName,
-                    this.address,
-                    submissionDifficulty,
-                    this.userAgent,
-                    'sv2',
-                );
+                if ((addressBest?.affected ?? 0) > 0) {
+                    void this.notificationService.notifyBestDifficulty(
+                        this.workerName,
+                        this.address,
+                        submissionDifficulty,
+                        this.userAgent,
+                        'sv2',
+                    );
+                }
             }
         } catch (error) {
             console.log(error);
