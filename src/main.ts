@@ -7,6 +7,7 @@ import { readFileSync } from 'fs';
 import * as ecc from 'tiny-secp256k1';
 
 import { AppModule } from './app.module';
+import { markShuttingDown } from './shutdown';
 
 async function bootstrap() {
 
@@ -40,11 +41,13 @@ async function bootstrap() {
 
   process.on('SIGINT', () => {
     console.log(`Stopping services`);
+    markShuttingDown();
     process.exit(0);
   });
 
   process.on('SIGTERM', () => {
     console.log(`Stopping services`);
+    markShuttingDown();
     process.exit(0);
   });
 

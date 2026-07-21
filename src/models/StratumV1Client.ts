@@ -484,6 +484,10 @@ export class StratumV1Client {
 
         if (this.creatingEntity == null) {
             this.creatingEntity = (async () => {
+                const returningWorker = await this.clientService.hasWorkerHistory(
+                    this.clientAuthorization.address,
+                    this.clientAuthorization.worker,
+                );
                 this.entity = await this.clientService.insert({
                     sessionId: this.extraNonceAndSessionId,
                     address: this.clientAuthorization.address,
@@ -499,12 +503,15 @@ export class StratumV1Client {
                     this.clientAuthorization.worker,
                     this.extraNonceAndSessionId,
                 );
-                void this.notificationService.notifyMinerConnected(
-                    this.clientAuthorization.worker,
-                    this.clientAuthorization.address,
-                    'sv1',
-                    this.entity?.userAgent || this.clientSubscription?.userAgent,
-                );
+                // Only alert for first-seen workers — reconnects after update are noise.
+                if (!returningWorker) {
+                    void this.notificationService.notifyMinerConnected(
+                        this.clientAuthorization.worker,
+                        this.clientAuthorization.address,
+                        'sv1',
+                        this.entity?.userAgent || this.clientSubscription?.userAgent,
+                    );
+                }
             })();
         }
 
@@ -602,23 +609,27 @@ export class StratumV1Client {
                 );
                 const blockHex = updatedJobBlock.toHex(false);
                 const result = await this.bitcoinRpcService.SUBMIT_BLOCK(blockHex);
+                const height = jobTemplate.blockData.height;
+                const alreadyRecorded = await this.blocksService.existsByHeight(height);
                 await this.blocksService.save({
-                    height: jobTemplate.blockData.height,
+                    height,
                     minerAddress: this.clientAuthorization.address,
                     worker: this.clientAuthorization.worker,
                     sessionId: this.extraNonceAndSessionId,
                     blockData: blockHex
                 });
 
-                await this.notificationService.notifySubscribersBlockFound(
-                    this.clientAuthorization.address,
-                    jobTemplate.blockData.height,
-                    updatedJobBlock,
-                    result,
-                    this.clientAuthorization.worker,
-                    this.entity?.userAgent || this.clientSubscription?.userAgent,
-                    'sv1',
-                );
+                if (!alreadyRecorded) {
+                    await this.notificationService.notifySubscribersBlockFound(
+                        this.clientAuthorization.address,
+                        height,
+                        updatedJobBlock,
+                        result,
+                        this.clientAuthorization.worker,
+                        this.entity?.userAgent || this.clientSubscription?.userAgent,
+                        'sv1',
+                    );
+                }
                 //success
                 if (result == null) {
                     await this.addressSettingsService.resetBestDifficultyAndShares();

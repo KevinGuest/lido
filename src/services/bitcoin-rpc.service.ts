@@ -6,6 +6,7 @@ import { BehaviorSubject, filter, shareReplay } from 'rxjs';
 import * as zmq from 'zeromq';
 
 import { RpcBlockService } from '../ORM/rpc-block/rpc-block.service';
+import { IBlockchainInfo } from '../models/bitcoin-rpc/IBlockchainInfo';
 import { IBlockTemplate } from '../models/bitcoin-rpc/IBlockTemplate';
 import { IMiningInfo } from '../models/bitcoin-rpc/IMiningInfo';
 
@@ -170,6 +171,15 @@ export class BitcoinRpcService implements OnModuleInit {
             return null;
         }
 
+    }
+
+    public async getBlockchainInfo(): Promise<IBlockchainInfo | null> {
+        try {
+            return await this.callRpc<IBlockchainInfo>('getblockchaininfo');
+        } catch (e) {
+            console.error('Error getblockchaininfo', e.message);
+            return null;
+        }
     }
 
     public async SUBMIT_BLOCK(hexdata: string): Promise<string> {

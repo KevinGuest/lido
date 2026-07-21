@@ -22,6 +22,11 @@ export class BlocksService {
         await this.blocksRepository.save(block);
     }
 
+    public async existsByHeight(height: number): Promise<boolean> {
+        const count = await this.blocksRepository.count({ where: { height } });
+        return count > 0;
+    }
+
     public async getFoundBlocks() {
         return await this.blocksRepository.find({
             select: {

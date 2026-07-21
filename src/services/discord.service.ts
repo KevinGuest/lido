@@ -170,7 +170,6 @@ export class DiscordService {
             color: meta.color,
             fields,
             timestamp: new Date().toISOString(),
-            footer: { text: 'Lido' },
         };
     }
 

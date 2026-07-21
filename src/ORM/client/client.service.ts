@@ -100,6 +100,20 @@ export class ClientService {
             .execute();
     }
 
+    /**
+     * True if this address+worker has any prior session (including soft-deleted).
+     * Used to skip "miner connected" spam on reconnect / app update.
+     */
+    public async hasWorkerHistory(address: string, clientName: string): Promise<boolean> {
+        const count = await this.clientRepository
+            .createQueryBuilder('c')
+            .withDeleted()
+            .where('c.address = :address', { address })
+            .andWhere('c.clientName = :clientName', { clientName })
+            .getCount();
+        return count > 0;
+    }
+
     public async heartbeat(address: string, clientName: string, sessionId: string, hashRate: number, updatedAt: Date) {
         return await this.clientRepository.update({ address, clientName, sessionId }, { hashRate, deletedAt: null, updatedAt });
     }

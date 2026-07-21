@@ -6,12 +6,15 @@ import { ConfigService } from '@nestjs/config';
 import { DiscordService, NotificationMessage } from './discord.service';
 import { NotificationEventKey, NotificationSettingsService } from './notification-settings.service';
 import { TelegramService } from './telegram.service';
+import { isShuttingDown } from '../shutdown';
 
 const STRUGGLING_COOLDOWN_MS = 15 * 60 * 1000;
 
 @Injectable()
 export class NotificationService implements OnModuleInit {
     private readonly strugglingLastSent = new Map<string, number>();
+    /** Dedupe block-found alerts (same height) within this process. */
+    private readonly notifiedBlockHeights = new Set<number>();
 
     constructor(
         private readonly telegramService: TelegramService,
@@ -33,6 +36,14 @@ export class NotificationService implements OnModuleInit {
         device?: string,
         protocol?: string,
     ) {
+        if (!Number.isFinite(height) || height <= 0) {
+            return;
+        }
+        if (this.notifiedBlockHeights.has(height)) {
+            return;
+        }
+        this.notifiedBlockHeights.add(height);
+
         let blockHash = '';
         try {
             blockHash = block.getId();
@@ -90,6 +101,9 @@ export class NotificationService implements OnModuleInit {
         device?: string,
         protocol?: string,
     ) {
+        if (isShuttingDown()) {
+            return;
+        }
         await this.emit({
             event: 'minerDisconnect',
             worker,

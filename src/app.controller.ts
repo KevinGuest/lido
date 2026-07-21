@@ -1,7 +1,6 @@
 import { BadRequestException, Body, Controller, Get, Inject, Post, Query } from '@nestjs/common';
 import { CACHE_MANAGER } from '@nestjs/cache-manager';
 import { Cache } from 'cache-manager';
-import * as os from 'os';
 import { firstValueFrom } from 'rxjs';
 
 import { AddressSettingsService } from './ORM/address-settings/address-settings.service';
@@ -11,27 +10,6 @@ import { ClientService } from './ORM/client/client.service';
 import { PoolMetaService } from './ORM/pool-meta/pool-meta.service';
 import { BitcoinRpcService } from './services/bitcoin-rpc.service';
 import { StratumV2Service } from './services/stratum-v2.service';
-
-function platformLabel(): string {
-  switch (os.platform()) {
-    case 'win32':
-      return 'Windows';
-    case 'darwin':
-      return 'macOS';
-    case 'linux':
-      return 'Linux';
-    case 'freebsd':
-      return 'FreeBSD';
-    case 'openbsd':
-      return 'OpenBSD';
-    case 'sunos':
-      return 'Solaris';
-    case 'aix':
-      return 'AIX';
-    default:
-      return os.platform();
-  }
-}
 
 @Controller()
 export class AppController {
@@ -128,7 +106,6 @@ export class AppController {
       highScores,
       uptime: this.bootAt,
       startedAt,
-      platform: platformLabel(),
       sharesAccepted: rolledUp.accepted + shareTotals.accepted,
       sharesRejected: rolledUp.rejected + shareTotals.rejected,
       bestDifficulty: Math.max(highScoreBest, workerBest, userAgentBest),
@@ -176,10 +153,15 @@ export class AppController {
   @Get('network')
   public async network() {
     const miningInfo = await firstValueFrom(this.bitcoinRpcService.newBlock$);
+    const chainInfo = await this.bitcoinRpcService.getBlockchainInfo();
     // UI expects `height`; bitcoind getmininginfo uses `blocks`.
+    // headers / verificationprogress come from getblockchaininfo (IBD).
     return {
       ...miningInfo,
       height: miningInfo?.blocks,
+      headers: chainInfo?.headers ?? null,
+      verificationprogress: chainInfo?.verificationprogress ?? null,
+      initialblockdownload: chainInfo?.initialblockdownload ?? null,
     };
   }
 

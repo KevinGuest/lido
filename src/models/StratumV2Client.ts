@@ -563,22 +563,26 @@ export class StratumV2Client {
             );
             const blockHex = updatedJobBlock.toHex(false);
             const result = await this.bitcoinRpcService.SUBMIT_BLOCK(blockHex);
+            const height = jobState.jobTemplate.blockData.height;
+            const alreadyRecorded = await this.blocksService.existsByHeight(height);
             await this.blocksService.save({
-                height: jobState.jobTemplate.blockData.height,
+                height,
                 minerAddress: this.address,
                 worker: this.workerName,
                 sessionId: this.sessionId,
                 blockData: blockHex,
             });
-            await this.notificationService.notifySubscribersBlockFound(
-                this.address,
-                jobState.jobTemplate.blockData.height,
-                updatedJobBlock,
-                result,
-                this.workerName,
-                this.userAgent,
-                'sv2',
-            );
+            if (!alreadyRecorded) {
+                await this.notificationService.notifySubscribersBlockFound(
+                    this.address,
+                    height,
+                    updatedJobBlock,
+                    result,
+                    this.workerName,
+                    this.userAgent,
+                    'sv2',
+                );
+            }
             if (result == null) {
                 await this.addressSettingsService.resetBestDifficultyAndShares();
             }
@@ -730,22 +734,26 @@ export class StratumV2Client {
             );
             const blockHex = updatedJobBlock.toHex(false);
             const result = await this.bitcoinRpcService.SUBMIT_BLOCK(blockHex);
+            const height = jobState.jobTemplate.blockData.height;
+            const alreadyRecorded = await this.blocksService.existsByHeight(height);
             await this.blocksService.save({
-                height: jobState.jobTemplate.blockData.height,
+                height,
                 minerAddress: this.address,
                 worker: this.workerName,
                 sessionId: this.sessionId,
                 blockData: blockHex,
             });
-            await this.notificationService.notifySubscribersBlockFound(
-                this.address,
-                jobState.jobTemplate.blockData.height,
-                updatedJobBlock,
-                result,
-                this.workerName,
-                this.userAgent,
-                'sv2',
-            );
+            if (!alreadyRecorded) {
+                await this.notificationService.notifySubscribersBlockFound(
+                    this.address,
+                    height,
+                    updatedJobBlock,
+                    result,
+                    this.workerName,
+                    this.userAgent,
+                    'sv2',
+                );
+            }
             if (result == null) {
                 await this.addressSettingsService.resetBestDifficultyAndShares();
             }
@@ -1171,6 +1179,10 @@ export class StratumV2Client {
         }
         if (this.creatingEntity == null) {
             this.creatingEntity = (async () => {
+                const returningWorker = await this.clientService.hasWorkerHistory(
+                    this.address,
+                    this.workerName,
+                );
                 this.entity = await this.clientService.insert({
                     sessionId: this.sessionId,
                     address: this.address,
@@ -1185,12 +1197,14 @@ export class StratumV2Client {
                     this.workerName,
                     this.sessionId,
                 );
-                void this.notificationService.notifyMinerConnected(
-                    this.workerName,
-                    this.address,
-                    'sv2',
-                    this.userAgent,
-                );
+                if (!returningWorker) {
+                    void this.notificationService.notifyMinerConnected(
+                        this.workerName,
+                        this.address,
+                        'sv2',
+                        this.userAgent,
+                    );
+                }
             })();
         }
         await this.creatingEntity;
