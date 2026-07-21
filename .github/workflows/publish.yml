@@ -99,7 +99,32 @@ jobs:
       - name: Create multi-arch manifest
         working-directory: /tmp/digests
         run: |
+          set -euo pipefail
+          digests="$(printf '${{ needs.version.outputs.image }}@sha256:%s ' *)"
+          echo "Creating manifest from: $digests"
           docker buildx imagetools create \
             -t "${{ needs.version.outputs.image }}:${{ needs.version.outputs.tag }}" \
             -t "${{ needs.version.outputs.image }}:latest" \
-            $(printf '${{ needs.version.outputs.image }}@sha256:%s ' *)
+            $digests
+
+      - name: Verify platform manifests are pullable
+        run: |
+          set -euo pipefail
+          image="${{ needs.version.outputs.image }}:${{ needs.version.outputs.tag }}"
+          docker buildx imagetools inspect "$image"
+          for platform in linux/amd64 linux/arm64; do
+            echo "Checking $platform..."
+            digest="$(docker buildx imagetools inspect --raw "$image" \
+              | jq -r --arg p "$platform" '
+                  .manifests[]
+                  | select(.platform.os + "/" + .platform.architecture == $p)
+                  | .digest
+                ')"
+            if [ -z "$digest" ] || [ "$digest" = "null" ]; then
+              echo "Missing $platform in index" >&2
+              exit 1
+            fi
+            # Resolve the platform manifest through the registry (fails if GC'd / never pushed)
+            docker buildx imagetools inspect "${{ needs.version.outputs.image }}@$digest" >/dev/null
+            echo "OK $platform -> $digest"
+          done
