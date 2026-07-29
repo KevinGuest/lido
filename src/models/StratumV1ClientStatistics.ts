@@ -18,6 +18,8 @@ export class StratumV1ClientStatistics {
     private shares: number = 0;
     private acceptedCount: number = 0;
     private rejectedCount: number = 0;
+    /** In-memory reject breakdown by wire error_code (not persisted to DB). */
+    private rejectedByCode = new Map<string, number>();
 
     private submissionCacheStart: Date;
     /** Wall time of last accepted share (idle/abandon clock). */
@@ -114,8 +116,15 @@ export class StratumV1ClientStatistics {
 
     }
 
-    /** Count a rejected mining.submit (stale / duplicate / low-diff). Does not affect hashrate. */
-    public async addRejected(client: ClientEntity) {
+    /**
+     * Count a rejected mining.submit (stale / duplicate / low-diff).
+     * Does not affect hashrate. Optional errorCode is tracked in-memory only.
+     */
+    public async addRejected(client: ClientEntity, errorCode?: string) {
+        if (errorCode) {
+            this.rejectedByCode.set(errorCode, (this.rejectedByCode.get(errorCode) ?? 0) + 1);
+        }
+
         const date = new Date();
         const timeSlot = this.timeSlot(date);
 
@@ -148,6 +157,11 @@ export class StratumV1ClientStatistics {
             await this.clientStatisticsService.update(this.bucketPayload(client));
             this.lastSave = date.getTime();
         }
+    }
+
+    /** Session-local reject counts by SV2/SV1 error string (not rolled into DB buckets). */
+    public getRejectedByCode(): Record<string, number> {
+        return Object.fromEntries(this.rejectedByCode);
     }
 
     public getSuggestedDifficulty(clientDifficulty: number): {

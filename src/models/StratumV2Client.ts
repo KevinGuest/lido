@@ -23,7 +23,11 @@ import {
     SV2_NOISE_ACT1_SIZE,
     Sv2MiningSetupFlags,
     Sv2MsgType,
+    Sv2OpenChannelErrorCode,
     Sv2Protocol,
+    Sv2SetupErrorCode,
+    Sv2SubmitSharesErrorCode,
+    Sv2UpdateChannelErrorCode,
 } from './sv2/sv2-constants';
 import {
     deserializeOpenExtendedMiningChannel,
@@ -291,7 +295,10 @@ export class StratumV2Client {
         if (message.protocol !== Sv2Protocol.MINING) {
             await this.sendFrame(
                 Sv2MsgType.SETUP_CONNECTION_ERROR,
-                serializeSetupConnectionError({ flags: 0, errorCode: 'unsupported-protocol' }),
+                serializeSetupConnectionError({
+                    flags: 0,
+                    errorCode: Sv2SetupErrorCode.UNSUPPORTED_PROTOCOL,
+                }),
             );
             this.closeSocket();
             return;
@@ -300,14 +307,30 @@ export class StratumV2Client {
         if (message.minVersion > 2 || message.maxVersion < 2) {
             await this.sendFrame(
                 Sv2MsgType.SETUP_CONNECTION_ERROR,
-                serializeSetupConnectionError({ flags: 0, errorCode: 'protocol-version-mismatch' }),
+                serializeSetupConnectionError({
+                    flags: 0,
+                    errorCode: Sv2SetupErrorCode.PROTOCOL_VERSION_MISMATCH,
+                }),
+            );
+            this.closeSocket();
+            return;
+        }
+
+        // Work selection / SET_CUSTOM_MINING_JOB is not implemented — reject the
+        // flag so clients fail fast instead of hanging on ignored custom-job frames.
+        if ((message.flags & Sv2MiningSetupFlags.REQUIRES_WORK_SELECTION) !== 0) {
+            await this.sendFrame(
+                Sv2MsgType.SETUP_CONNECTION_ERROR,
+                serializeSetupConnectionError({
+                    flags: Sv2MiningSetupFlags.REQUIRES_WORK_SELECTION,
+                    errorCode: Sv2SetupErrorCode.UNSUPPORTED_FEATURE_FLAGS,
+                }),
             );
             this.closeSocket();
             return;
         }
 
         const supportedFlags = Sv2MiningSetupFlags.REQUIRES_STANDARD_JOBS
-            | Sv2MiningSetupFlags.REQUIRES_WORK_SELECTION
             | Sv2MiningSetupFlags.REQUIRES_VERSION_ROLLING;
         const unsupportedFlags = message.flags & ~supportedFlags;
         if (unsupportedFlags !== 0) {
@@ -315,7 +338,7 @@ export class StratumV2Client {
                 Sv2MsgType.SETUP_CONNECTION_ERROR,
                 serializeSetupConnectionError({
                     flags: unsupportedFlags,
-                    errorCode: 'unsupported-feature-flags',
+                    errorCode: Sv2SetupErrorCode.UNSUPPORTED_FEATURE_FLAGS,
                 }),
             );
             this.closeSocket();
@@ -337,18 +360,21 @@ export class StratumV2Client {
         const { address, workerName } = this.parseUserIdentity(message.user_identity);
 
         if (!this.isValidAddress(address)) {
-            await this.sendOpenChannelError(message.requestId, 'unknown-user');
+            await this.sendOpenChannelError(message.requestId, Sv2OpenChannelErrorCode.UNKNOWN_USER);
             this.closeSocket();
             return;
         }
 
         if (this.address != null && this.address !== address) {
-            await this.sendOpenChannelError(message.requestId, 'unknown-user');
+            await this.sendOpenChannelError(message.requestId, Sv2OpenChannelErrorCode.UNKNOWN_USER);
             return;
         }
 
         if (message.maxTarget.length !== 32 || message.maxTarget.every(byte => byte === 0)) {
-            await this.sendOpenChannelError(message.requestId, 'max-target-out-of-range');
+            await this.sendOpenChannelError(
+                message.requestId,
+                Sv2OpenChannelErrorCode.MAX_TARGET_OUT_OF_RANGE,
+            );
             return;
         }
 
@@ -407,18 +433,21 @@ export class StratumV2Client {
         const { address, workerName } = this.parseUserIdentity(message.userIdentity);
 
         if (!this.isValidAddress(address)) {
-            await this.sendOpenChannelError(message.requestId, 'unknown-user');
+            await this.sendOpenChannelError(message.requestId, Sv2OpenChannelErrorCode.UNKNOWN_USER);
             this.closeSocket();
             return;
         }
 
         if (this.address != null && this.address !== address) {
-            await this.sendOpenChannelError(message.requestId, 'unknown-user');
+            await this.sendOpenChannelError(message.requestId, Sv2OpenChannelErrorCode.UNKNOWN_USER);
             return;
         }
 
         if (message.maxTarget.length !== 32 || message.maxTarget.every(byte => byte === 0)) {
-            await this.sendOpenChannelError(message.requestId, 'max-target-out-of-range');
+            await this.sendOpenChannelError(
+                message.requestId,
+                Sv2OpenChannelErrorCode.MAX_TARGET_OUT_OF_RANGE,
+            );
             return;
         }
 
@@ -439,7 +468,10 @@ export class StratumV2Client {
         const extranonceSize = Math.max(defaultMinerExtranonceSize, requestedMinerExtranonceSize);
         if (extranonceSize > maxMinerExtranonceSize) {
             this.stratumV2Service.releaseExtranoncePrefix(channelId);
-            await this.sendOpenChannelError(message.requestId, 'min-extranonce-size-too-large');
+            await this.sendOpenChannelError(
+                message.requestId,
+                Sv2OpenChannelErrorCode.MIN_EXTRANONCE_SIZE_TOO_LARGE,
+            );
             return;
         }
 
@@ -493,14 +525,21 @@ export class StratumV2Client {
         const submission = deserializeSubmitSharesStandard(new BufferReader(payload));
         const channel = this.channels.get(submission.channelId);
         if (channel == null || channel.channelType !== 'standard') {
-            await this.sendShareError(submission.channelId, submission.sequenceNumber, 'invalid-channel-id');
+            await this.sendShareError(
+                submission.channelId,
+                submission.sequenceNumber,
+                Sv2SubmitSharesErrorCode.INVALID_CHANNEL_ID,
+            );
             return;
         }
 
         const jobState = channel.jobs.get(submission.jobId);
         if (jobState == null) {
-            await this.sendShareError(submission.channelId, submission.sequenceNumber, 'invalid-job-id');
-            await this.recordRejectedShare();
+            await this.sendShareError(
+                submission.channelId,
+                submission.sequenceNumber,
+                Sv2SubmitSharesErrorCode.INVALID_JOB_ID,
+            );
             return;
         }
 
@@ -512,8 +551,11 @@ export class StratumV2Client {
             submission.version,
         ].join(':');
         if (this.submissionHashes.has(submissionKey)) {
-            await this.sendShareError(submission.channelId, submission.sequenceNumber, 'duplicate-share');
-            await this.recordRejectedShare();
+            await this.sendShareError(
+                submission.channelId,
+                submission.sequenceNumber,
+                Sv2SubmitSharesErrorCode.DUPLICATE_SHARE,
+            );
             return;
         }
         this.submissionHashes.add(submissionKey);
@@ -521,8 +563,11 @@ export class StratumV2Client {
         const jobVersion = jobState.jobTemplate.block.version >>> 0;
         const submitVersion = submission.version >>> 0;
         if (((submitVersion ^ jobVersion) & BIP320_CONSENSUS_VERSION_MASK) !== 0) {
-            await this.sendShareError(submission.channelId, submission.sequenceNumber, 'invalid-version');
-            await this.recordRejectedShare();
+            await this.sendShareError(
+                submission.channelId,
+                submission.sequenceNumber,
+                Sv2SubmitSharesErrorCode.INVALID_VERSION,
+            );
             return;
         }
 
@@ -548,8 +593,11 @@ export class StratumV2Client {
                 + `job=${submission.jobId} shareDiff=${submissionDifficulty.toFixed(2)} `
                 + `targetDiff=${channel.sessionDifficulty} version=0x${submitVersion.toString(16)}`,
             );
-            await this.sendShareError(submission.channelId, submission.sequenceNumber, 'difficulty-too-low');
-            await this.recordRejectedShare();
+            await this.sendShareError(
+                submission.channelId,
+                submission.sequenceNumber,
+                Sv2SubmitSharesErrorCode.DIFFICULTY_TOO_LOW,
+            );
             return;
         }
 
@@ -643,7 +691,11 @@ export class StratumV2Client {
         const submission = deserializeSubmitSharesExtended(new BufferReader(payload));
         const channel = this.channels.get(submission.channelId);
         if (channel == null || channel.channelType !== 'extended') {
-            await this.sendShareError(submission.channelId, submission.sequenceNumber, 'invalid-channel-id');
+            await this.sendShareError(
+                submission.channelId,
+                submission.sequenceNumber,
+                Sv2SubmitSharesErrorCode.INVALID_CHANNEL_ID,
+            );
             return;
         }
 
@@ -652,14 +704,20 @@ export class StratumV2Client {
             || jobState.coinbasePrefix == null
             || jobState.coinbaseSuffix == null
             || jobState.merklePath == null) {
-            await this.sendShareError(submission.channelId, submission.sequenceNumber, 'invalid-job-id');
-            await this.recordRejectedShare();
+            await this.sendShareError(
+                submission.channelId,
+                submission.sequenceNumber,
+                Sv2SubmitSharesErrorCode.INVALID_JOB_ID,
+            );
             return;
         }
 
         if (submission.extranonce.length !== channel.extranonceSize) {
-            await this.sendShareError(submission.channelId, submission.sequenceNumber, 'invalid-extranonce-size');
-            await this.recordRejectedShare();
+            await this.sendShareError(
+                submission.channelId,
+                submission.sequenceNumber,
+                Sv2SubmitSharesErrorCode.INVALID_EXTRANONCE_SIZE,
+            );
             return;
         }
 
@@ -672,8 +730,11 @@ export class StratumV2Client {
             submission.extranonce.toString('hex'),
         ].join(':');
         if (this.submissionHashes.has(submissionKey)) {
-            await this.sendShareError(submission.channelId, submission.sequenceNumber, 'duplicate-share');
-            await this.recordRejectedShare();
+            await this.sendShareError(
+                submission.channelId,
+                submission.sequenceNumber,
+                Sv2SubmitSharesErrorCode.DUPLICATE_SHARE,
+            );
             return;
         }
         this.submissionHashes.add(submissionKey);
@@ -694,8 +755,11 @@ export class StratumV2Client {
         const submitVersion = submission.version >>> 0;
         // BIP320: only general-purpose bits may differ from the job version.
         if (((submitVersion ^ jobVersion) & BIP320_CONSENSUS_VERSION_MASK) !== 0) {
-            await this.sendShareError(submission.channelId, submission.sequenceNumber, 'invalid-version');
-            await this.recordRejectedShare();
+            await this.sendShareError(
+                submission.channelId,
+                submission.sequenceNumber,
+                Sv2SubmitSharesErrorCode.INVALID_VERSION,
+            );
             return;
         }
 
@@ -720,8 +784,11 @@ export class StratumV2Client {
                 + `job=${submission.jobId} shareDiff=${submissionDifficulty.toFixed(2)} `
                 + `targetDiff=${channel.sessionDifficulty} version=0x${submitVersion.toString(16)}`,
             );
-            await this.sendShareError(submission.channelId, submission.sequenceNumber, 'difficulty-too-low');
-            await this.recordRejectedShare();
+            await this.sendShareError(
+                submission.channelId,
+                submission.sequenceNumber,
+                Sv2SubmitSharesErrorCode.DIFFICULTY_TOO_LOW,
+            );
             return;
         }
 
@@ -818,7 +885,7 @@ export class StratumV2Client {
                 Sv2MsgType.UPDATE_CHANNEL_ERROR,
                 serializeUpdateChannelError({
                     channelId: message.channelId,
-                    errorCode: 'invalid-channel-id',
+                    errorCode: Sv2UpdateChannelErrorCode.INVALID_CHANNEL_ID,
                 }),
             );
             return;
@@ -829,7 +896,7 @@ export class StratumV2Client {
                 Sv2MsgType.UPDATE_CHANNEL_ERROR,
                 serializeUpdateChannelError({
                     channelId: message.channelId,
-                    errorCode: 'max-target-out-of-range',
+                    errorCode: Sv2UpdateChannelErrorCode.MAX_TARGET_OUT_OF_RANGE,
                 }),
             );
             return;
@@ -1119,9 +1186,11 @@ export class StratumV2Client {
                 return;
             }
 
-            const targetDiff = DifficultyUtils.clampDifficultyToMaxTarget(
-                suggestion.difficulty,
-                channel.maxTarget,
+            const targetDiff = this.clampDifficulty(
+                DifficultyUtils.clampDifficultyToMaxTarget(
+                    suggestion.difficulty,
+                    channel.maxTarget,
+                ),
             );
             if (targetDiff === channel.sessionDifficulty) {
                 continue;
@@ -1254,7 +1323,8 @@ export class StratumV2Client {
         this.entity.updatedAt = now;
     }
 
-    private async recordRejectedShare(): Promise<void> {
+    private async recordRejectedShare(errorCode: string): Promise<void> {
+        this.stratumV2Service.recordRejectedShare(errorCode);
         if (!this.address || !this.statistics) {
             return;
         }
@@ -1264,7 +1334,7 @@ export class StratumV2Client {
                 await this.ensureClientEntity(channel);
             }
             if (this.entity) {
-                await this.statistics.addRejected(this.entity);
+                await this.statistics.addRejected(this.entity, errorCode);
             }
         } catch (error) {
             console.log(error);
@@ -1370,6 +1440,7 @@ export class StratumV2Client {
             serializeSubmitSharesError({ channelId, sequenceNumber, errorCode }),
             SV2_CHANNEL_MSG_FLAG,
         );
+        await this.recordRejectedShare(errorCode);
     }
 
     private async sendFrame(msgType: number, payload: Buffer, extensionType = 0): Promise<void> {

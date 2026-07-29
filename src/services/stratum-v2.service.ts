@@ -51,6 +51,8 @@ export class StratumV2Service implements OnModuleInit, OnModuleDestroy {
     private enabled = false;
     private latestCanonicalJob: IJobTemplate = null;
     private canonicalJobSubscription: Subscription = null;
+    /** Process-local SV2 SubmitSharesError counts by error_code (not persisted). */
+    private readonly rejectedSharesByCode = new Map<string, number>();
 
     constructor(
         private readonly configService: ConfigService,
@@ -148,12 +150,23 @@ export class StratumV2Service implements OnModuleInit, OnModuleDestroy {
         return this.enabled;
     }
 
+    /** Increment process-local reject counter for diagnostics (`GET /info/sv2`). */
+    public recordRejectedShare(errorCode: string): void {
+        const code = (errorCode || '').trim() || 'unknown';
+        this.rejectedSharesByCode.set(code, (this.rejectedSharesByCode.get(code) ?? 0) + 1);
+    }
+
+    public getRejectedSharesByCode(): Record<string, number> {
+        return Object.fromEntries(this.rejectedSharesByCode);
+    }
+
     public async getPoolAuthorityPublicKey(): Promise<{
         publicKey: string;
         configured: boolean;
         enabled: boolean;
         source: 'env' | 'persisted' | 'generated' | null;
         rotatable: boolean;
+        rejectedSharesByCode: Record<string, number>;
     }> {
         if (!this.enabled) {
             return {
@@ -162,6 +175,7 @@ export class StratumV2Service implements OnModuleInit, OnModuleDestroy {
                 enabled: false,
                 source: null,
                 rotatable: false,
+                rejectedSharesByCode: {},
             };
         }
         await this.ensureInitialized();
@@ -172,6 +186,7 @@ export class StratumV2Service implements OnModuleInit, OnModuleDestroy {
             enabled: true,
             source: this.authorityKeySource,
             rotatable: this.isAuthorityRotatable(),
+            rejectedSharesByCode: this.getRejectedSharesByCode(),
         };
     }
 

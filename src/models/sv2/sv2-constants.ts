@@ -136,3 +136,46 @@ export enum Sv2MiningSetupSuccessFlags {
 export enum Sv2JdpSetupFlags {
   DECLARE_TX_DATA = 1 << 0,
 }
+
+// ── Wire error codes (STR0_255) ─────────────────────────────────────
+// Emitted by the Mining Protocol pool. Spec / codec tests may also exercise
+// unused strings (e.g. stale-share, invalid-channel) that this pool never sends.
+
+/** SetupConnectionError codes currently emitted. */
+export const Sv2SetupErrorCode = {
+  UNSUPPORTED_PROTOCOL: 'unsupported-protocol',
+  PROTOCOL_VERSION_MISMATCH: 'protocol-version-mismatch',
+  UNSUPPORTED_FEATURE_FLAGS: 'unsupported-feature-flags',
+} as const;
+
+/** OpenMiningChannelError codes currently emitted. */
+export const Sv2OpenChannelErrorCode = {
+  UNKNOWN_USER: 'unknown-user',
+  MAX_TARGET_OUT_OF_RANGE: 'max-target-out-of-range',
+  MIN_EXTRANONCE_SIZE_TOO_LARGE: 'min-extranonce-size-too-large',
+} as const;
+
+/** UpdateChannelError codes currently emitted. */
+export const Sv2UpdateChannelErrorCode = {
+  INVALID_CHANNEL_ID: 'invalid-channel-id',
+  MAX_TARGET_OUT_OF_RANGE: 'max-target-out-of-range',
+} as const;
+
+/** SubmitSharesError codes currently emitted. */
+export const Sv2SubmitSharesErrorCode = {
+  INVALID_CHANNEL_ID: 'invalid-channel-id',
+  INVALID_JOB_ID: 'invalid-job-id',
+  DUPLICATE_SHARE: 'duplicate-share',
+  INVALID_VERSION: 'invalid-version',
+  DIFFICULTY_TOO_LOW: 'difficulty-too-low',
+  INVALID_EXTRANONCE_SIZE: 'invalid-extranonce-size',
+} as const;
+
+/**
+ * Spec-named codes recognized in codecs/tests but not emitted by this pool.
+ * Kept for documentation / future use (e.g. stale jobs, alternate channel wording).
+ */
+export const Sv2UnusedErrorCode = {
+  STALE_SHARE: 'stale-share',
+  INVALID_CHANNEL: 'invalid-channel',
+} as const;

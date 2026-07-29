@@ -18,8 +18,6 @@ import { RpcBlocksModule } from './ORM/rpc-block/rpc-block.module';
 import { TelegramSubscriptionsModule } from './ORM/telegram-subscriptions/telegram-subscriptions.module';
 import { AppService } from './services/app.service';
 import { BitcoinRpcService } from './services/bitcoin-rpc.service';
-import { BraiinsService } from './services/braiins.service';
-import { BTCPayService } from './services/btc-pay.service';
 import { DiscordService } from './services/discord.service';
 import { NotificationService } from './services/notification.service';
 import { StratumV1JobsService } from './services/stratum-v1-jobs.service';
@@ -87,8 +85,6 @@ const ORMModules = [
         PoolLogService,
         BitcoinAddressValidator,
         StratumV1JobsService,
-        BTCPayService,
-        BraiinsService,
         ExternalSharesService,
     ],
 })

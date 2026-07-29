@@ -51,7 +51,13 @@ See `.env.example` for `SV2_AUTHORITY_PRIVKEY`, `SV2_START_DIFFICULTY`, and `SV2
 
 Miners need the pool authority public key for Noise auth. Lido exposes it at `GET /api/info/sv2` (`authorityPublicKey`) and shows it in the Connect dialog’s SV2 tab. If `SV2_AUTHORITY_PRIVKEY` is unset, a key is generated and persisted under `DB/sv2-authority.privkey` so the pubkey survives restarts. Set `SV2_AUTHORITY_ROTATABLE=false` on public/shared pools so the rotate API/UI stays off.
 
-Job Declaration / Template Distribution protocols are not included.
+`GET /api/info/sv2` also returns process-local `rejectedSharesByCode` (SubmitSharesError breakdown; not persisted across restarts).
+
+**Not included (parked):** Job Declaration (JDP), Template Distribution (TDP), and `SET_CUSTOM_MINING_JOB` / work selection. Clients that set `REQUIRES_WORK_SELECTION` are rejected at `SetupConnection` with `unsupported-feature-flags`. Extranonce allocation is already unique per channel (process-namespaced); revisit only if multi-process collisions or proxy sub-allocation appear.
+
+### SRI interop
+
+Use the Stratum Reference Implementation as a conformance oracle against this pool. Maintainer checklist and commands: [`scripts/sv2-sri-interop.md`](scripts/sv2-sri-interop.md).
 
 ## Alerts
 

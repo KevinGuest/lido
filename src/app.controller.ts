@@ -38,6 +38,7 @@ export class AppController {
       configured: authority.configured,
       source: authority.source,
       rotatable: authority.rotatable,
+      rejectedSharesByCode: authority.rejectedSharesByCode,
     };
   }
 

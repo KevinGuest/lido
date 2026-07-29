@@ -189,7 +189,7 @@ describe('SV2 Messages', () => {
     const msg: Sv2SubmitSharesError = {
       channelId: 1,
       sequenceNumber: 42,
-      errorCode: 'stale-share',
+      errorCode: 'stale-share', // Sv2UnusedErrorCode — codec coverage only; pool does not emit
     };
     const result = roundTrip(msg, serializeSubmitSharesError, deserializeSubmitSharesError);
     expect(result).toEqual(msg);
@@ -221,7 +221,7 @@ describe('SV2 Messages', () => {
   it('UpdateChannelError round-trips', () => {
     const msg: Sv2UpdateChannelError = {
       channelId: 3,
-      errorCode: 'invalid-channel',
+      errorCode: 'invalid-channel', // Sv2UnusedErrorCode — codec coverage only; pool does not emit
     };
     const result = roundTrip(msg, serializeUpdateChannelError, deserializeUpdateChannelError);
     expect(result).toEqual(msg);

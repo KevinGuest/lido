@@ -98,6 +98,17 @@ describe('StratumV1ClientStatistics', () => {
         });
     });
 
+    it('should track rejected shares by error code in memory', async () => {
+        await statistics.addRejected(client, 'difficulty-too-low');
+        await statistics.addRejected(client, 'duplicate-share');
+        await statistics.addRejected(client, 'difficulty-too-low');
+
+        expect(statistics.getRejectedByCode()).toEqual({
+            'difficulty-too-low': 2,
+            'duplicate-share': 1,
+        });
+    });
+
     it('should persist rejected shares on the minute flush', async () => {
         await statistics.addShares(client, 64);
         await statistics.addRejected(client);
