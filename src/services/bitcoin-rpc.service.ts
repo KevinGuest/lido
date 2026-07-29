@@ -9,6 +9,21 @@ import { RpcBlockService } from '../ORM/rpc-block/rpc-block.service';
 import { IBlockchainInfo } from '../models/bitcoin-rpc/IBlockchainInfo';
 import { IBlockTemplate } from '../models/bitcoin-rpc/IBlockTemplate';
 import { IMiningInfo } from '../models/bitcoin-rpc/IMiningInfo';
+import {
+    BlockHeaderBitsTime,
+    DifficultyAdjustment,
+    EPOCH_BLOCK_LENGTH,
+    calcDifficultyAdjustmentFromHeaders,
+    parseBits,
+} from './difficulty-adjustment';
+
+type RpcBlockHeader = {
+    height?: number;
+    time?: number;
+    bits?: string | number;
+};
+
+const DIFFICULTY_ADJ_CACHE_MS = 30_000;
 
 @Injectable()
 export class BitcoinRpcService implements OnModuleInit {
@@ -18,6 +33,11 @@ export class BitcoinRpcService implements OnModuleInit {
     private rpcRequestId = 0;
     private _newBlock$: BehaviorSubject<IMiningInfo> = new BehaviorSubject(undefined);
     public newBlock$ = this._newBlock$.pipe(filter(block => block != null), shareReplay({ refCount: true, bufferSize: 1 }));
+    private difficultyAdjustmentCache: {
+        atMs: number;
+        tipHeight: number;
+        value: DifficultyAdjustment | null;
+    } | null = null;
 
     constructor(
         private readonly configService: ConfigService,
@@ -180,6 +200,79 @@ export class BitcoinRpcService implements OnModuleInit {
             console.error('Error getblockchaininfo', e.message);
             return null;
         }
+    }
+
+    /**
+     * Difficulty-epoch progress / avg block time from local bitcoind headers.
+     * Used by Umbrel / self-hosted dashboards (no mempool.space).
+     */
+    public async getDifficultyAdjustment(
+        tipHeight?: number,
+    ): Promise<DifficultyAdjustment | null> {
+        const height =
+            tipHeight ??
+            (await this.getMiningInfo())?.blocks ??
+            (await this.getBlockchainInfo())?.blocks;
+        if (height == null || !Number.isFinite(height) || height < 1) {
+            return null;
+        }
+
+        const cached = this.difficultyAdjustmentCache;
+        if (
+            cached &&
+            cached.tipHeight === height &&
+            Date.now() - cached.atMs < DIFFICULTY_ADJ_CACHE_MS
+        ) {
+            return cached.value;
+        }
+
+        try {
+            const blocksInEpoch = height % EPOCH_BLOCK_LENGTH;
+            const epochStartHeight = height - blocksInEpoch;
+            const previousEpochStartHeight = epochStartHeight - EPOCH_BLOCK_LENGTH;
+
+            const tip = await this.getHeaderBitsTime(height);
+            const epochStart = await this.getHeaderBitsTime(epochStartHeight);
+            if (!tip || !epochStart) {
+                return null;
+            }
+
+            let previousEpochStart: BlockHeaderBitsTime | null = null;
+            if (previousEpochStartHeight >= 0) {
+                previousEpochStart = await this.getHeaderBitsTime(previousEpochStartHeight);
+            }
+
+            const value = calcDifficultyAdjustmentFromHeaders(
+                tip,
+                epochStart,
+                previousEpochStart,
+            );
+            this.difficultyAdjustmentCache = {
+                atMs: Date.now(),
+                tipHeight: height,
+                value,
+            };
+            return value;
+        } catch (e) {
+            console.error('Error getDifficultyAdjustment', (e as Error).message);
+            return null;
+        }
+    }
+
+    private async getHeaderBitsTime(height: number): Promise<BlockHeaderBitsTime | null> {
+        const hash = await this.callRpc<string>('getblockhash', [height]);
+        if (!hash) {
+            return null;
+        }
+        const header = await this.callRpc<RpcBlockHeader>('getblockheader', [hash]);
+        if (header?.time == null || header.bits == null) {
+            return null;
+        }
+        return {
+            height: header.height ?? height,
+            time: Number(header.time),
+            bits: parseBits(header.bits),
+        };
     }
 
     public async SUBMIT_BLOCK(hexdata: string): Promise<string> {

@@ -105,6 +105,8 @@ export class StratumV2Client {
     private handshakeComplete = false;
     private processingHandshake = false;
     private destroyed = false;
+    /** At most one idle "struggling" alert per session — zombies get kicked instead. */
+    private idleStruggleNotified = false;
     private pendingSocketWriteBytes = 0;
     private userAgent = 'unknown';
     private address: string = null;
@@ -1104,6 +1106,19 @@ export class StratumV2Client {
                 continue;
             }
 
+            // Half-open / moved-away miner: drop session → disconnect alert, not struggle spam.
+            if (suggestion.reason === 'abandoned') {
+                console.log(
+                    `[SV2 ${this.sessionId}] Abandoning idle session `
+                    + `(no shares; likely left without clean disconnect)`,
+                );
+                await this.destroy();
+                if (!this.socket.destroyed) {
+                    this.socket.destroy();
+                }
+                return;
+            }
+
             const targetDiff = DifficultyUtils.clampDifficultyToMaxTarget(
                 suggestion.difficulty,
                 channel.maxTarget,
@@ -1119,7 +1134,12 @@ export class StratumV2Client {
             );
             channel.sessionDifficulty = targetDiff;
 
-            if (suggestion.reason === 'idle' && targetDiff < previous) {
+            if (
+                suggestion.reason === 'idle' &&
+                targetDiff < previous &&
+                !this.idleStruggleNotified
+            ) {
+                this.idleStruggleNotified = true;
                 void this.notificationService.notifyMinerStruggling(
                     this.workerName,
                     this.address,
@@ -1199,6 +1219,13 @@ export class StratumV2Client {
                 );
                 if (!returningWorker) {
                     void this.notificationService.notifyMinerConnected(
+                        this.workerName,
+                        this.address,
+                        'sv2',
+                        this.userAgent,
+                    );
+                } else {
+                    void this.notificationService.notifyMinerReconnected(
                         this.workerName,
                         this.address,
                         'sv2',

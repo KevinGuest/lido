@@ -5,6 +5,13 @@ const CACHE_SIZE = 30;
 const TARGET_SUBMISSION_PER_SECOND = 10;
 const MIN_DIFF = 0.00001;
 const SLOT_MS = 1000 * 60 * 10;
+/** No/low shares → try lowering difficulty (real high-diff miner). */
+const IDLE_AFTER_SEC = 60;
+/**
+ * Still quiet after this → treat as gone (half-open TCP after pool switch).
+ * Kick the session instead of spamming "miner struggling".
+ */
+const ABANDON_AFTER_SEC = 180;
 
 export class StratumV1ClientStatistics {
 
@@ -13,6 +20,8 @@ export class StratumV1ClientStatistics {
     private rejectedCount: number = 0;
 
     private submissionCacheStart: Date;
+    /** Wall time of last accepted share (idle/abandon clock). */
+    private lastShareAt: Date | null = null;
     private submissionCache: { time: Date, difficulty: number }[] = [];
 
     private currentTimeSlot: number = null;
@@ -61,7 +70,7 @@ export class StratumV1ClientStatistics {
             time: date,
             difficulty: targetDifficulty,
         });
-
+        this.lastShareAt = date;
 
         if (this.currentTimeSlot == null) {
             // First record, insert it
@@ -143,20 +152,24 @@ export class StratumV1ClientStatistics {
 
     public getSuggestedDifficulty(clientDifficulty: number): {
         difficulty: number;
-        reason: 'idle' | 'vardiff';
+        reason: 'idle' | 'vardiff' | 'abandoned';
     } | null {
 
-        // miner hasn't submitted shares in one minute — difficulty is likely too high
+        // Few/no shares: either difficulty too high (idle lower) or miner left (abandon).
         if (this.submissionCache.length < 5) {
-            if ((new Date().getTime() - this.submissionCacheStart.getTime()) / 1000 > 60) {
+            const anchor = this.lastShareAt ?? this.submissionCacheStart;
+            const idleSecs = (new Date().getTime() - anchor.getTime()) / 1000;
+            if (idleSecs > ABANDON_AFTER_SEC) {
+                return { difficulty: clientDifficulty, reason: 'abandoned' };
+            }
+            if (idleSecs > IDLE_AFTER_SEC) {
                 const difficulty = this.nearestPowerOfTwo(clientDifficulty / 6);
                 if (difficulty == null) {
                     return null;
                 }
                 return { difficulty, reason: 'idle' };
-            } else {
-                return null;
             }
+            return null;
         }
 
         const sum = this.submissionCache.reduce((pre, cur) => {

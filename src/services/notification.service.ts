@@ -10,11 +10,20 @@ import { isShuttingDown } from '../shutdown';
 
 const STRUGGLING_COOLDOWN_MS = 15 * 60 * 1000;
 
+function workerKey(address: string, worker: string): string {
+    return `${address}\0${worker}`;
+}
+
 @Injectable()
 export class NotificationService implements OnModuleInit {
     private readonly strugglingLastSent = new Map<string, number>();
     /** Dedupe block-found alerts (same height) within this process. */
     private readonly notifiedBlockHeights = new Set<number>();
+    /**
+     * Workers that went offline this process (not during app shutdown).
+     * Reconnect alerts only fire for these — skips restart/update noise.
+     */
+    private readonly awaitingReconnect = new Set<string>();
 
     constructor(
         private readonly telegramService: TelegramService,
@@ -95,6 +104,29 @@ export class NotificationService implements OnModuleInit {
         });
     }
 
+    /** Known worker back online after a real disconnect (not app restart). */
+    public async notifyMinerReconnected(
+        worker: string,
+        address: string,
+        protocol: string,
+        device?: string,
+    ) {
+        const key = workerKey(address, worker);
+        if (!this.awaitingReconnect.has(key)) {
+            return;
+        }
+        this.awaitingReconnect.delete(key);
+        await this.emit({
+            event: 'minerConnect',
+            title: 'Miner reconnected',
+            worker,
+            address,
+            device,
+            protocol,
+            action: `${worker} reconnected.`,
+        });
+    }
+
     public async notifyMinerDisconnected(
         worker: string,
         address: string,
@@ -104,6 +136,7 @@ export class NotificationService implements OnModuleInit {
         if (isShuttingDown()) {
             return;
         }
+        this.awaitingReconnect.add(workerKey(address, worker));
         await this.emit({
             event: 'minerDisconnect',
             worker,

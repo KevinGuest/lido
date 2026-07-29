@@ -171,8 +171,7 @@ export class StratumV2Service implements OnModuleInit, OnModuleDestroy {
             configured: this.authorityKeySource === 'env' || this.authorityKeySource === 'persisted',
             enabled: true,
             source: this.authorityKeySource,
-            // Env-pinned keys must be changed via SV2_AUTHORITY_PRIVKEY, not the UI.
-            rotatable: this.authorityKeySource !== 'env',
+            rotatable: this.isAuthorityRotatable(),
         };
     }
 
@@ -190,10 +189,13 @@ export class StratumV2Service implements OnModuleInit, OnModuleDestroy {
         }
         await this.ensureInitialized();
 
-        if (this.authorityKeySource === 'env') {
-            throw new Error(
-                'Authority key is pinned by SV2_AUTHORITY_PRIVKEY; unset that env to rotate from the UI',
-            );
+        if (!this.isAuthorityRotatable()) {
+            if (this.authorityKeySource === 'env') {
+                throw new Error(
+                    'Authority key is pinned by SV2_AUTHORITY_PRIVKEY; unset that env to rotate from the UI',
+                );
+            }
+            throw new Error('SV2 authority key rotation is disabled on this pool');
         }
 
         rotatePersistedSv2AuthorityPrivKey();
@@ -253,6 +255,18 @@ export class StratumV2Service implements OnModuleInit, OnModuleDestroy {
 
     private isEnabled(): boolean {
         const flag = this.configService.get<string>('ENABLE_STRATUM_V2');
+        return flag === 'true' || flag === '1';
+    }
+
+    /** Env-pinned keys, or SV2_AUTHORITY_ROTATABLE=false (public hosted), cannot rotate via API/UI. */
+    private isAuthorityRotatable(): boolean {
+        if (this.authorityKeySource === 'env') {
+            return false;
+        }
+        const flag = this.configService.get<string>('SV2_AUTHORITY_ROTATABLE');
+        if (flag == null || flag === '') {
+            return true;
+        }
         return flag === 'true' || flag === '1';
     }
 

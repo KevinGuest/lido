@@ -146,9 +146,19 @@ function defaultEvents(): NotificationEvents {
 
 function normalizeEvents(raw: unknown, fallback: NotificationEvents): NotificationEvents {
     const src = (raw && typeof raw === 'object' ? raw : {}) as Partial<NotificationEvents>;
+    // Legacy minerReconnect toggles fold into minerConnect.
+    const legacyReconnect =
+        typeof (src as { minerReconnect?: unknown }).minerReconnect === 'boolean'
+            ? (src as { minerReconnect: boolean }).minerReconnect
+            : undefined;
+    const minerConnect =
+        typeof src.minerConnect === 'boolean'
+            ? src.minerConnect || Boolean(legacyReconnect)
+            : legacyReconnect !== undefined
+              ? legacyReconnect
+              : fallback.minerConnect;
     return {
-        minerConnect:
-            typeof src.minerConnect === 'boolean' ? src.minerConnect : fallback.minerConnect,
+        minerConnect,
         minerDisconnect:
             typeof src.minerDisconnect === 'boolean'
                 ? src.minerDisconnect

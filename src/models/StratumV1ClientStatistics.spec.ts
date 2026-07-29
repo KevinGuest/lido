@@ -120,7 +120,7 @@ describe('StratumV1ClientStatistics', () => {
     });
 
     it('should lower difficulty when a miner has not submitted shares for several minutes', () => {
-        jest.setSystemTime(new Date('2026-05-06T12:06:00Z'));
+        jest.setSystemTime(new Date('2026-05-06T12:01:01Z'));
 
         expect(statistics.getSuggestedDifficulty(64)).toEqual({
             difficulty: 8,
@@ -128,6 +128,26 @@ describe('StratumV1ClientStatistics', () => {
         });
     });
 
+    it('should abandon a session that stays quiet past the idle window', () => {
+        jest.setSystemTime(new Date('2026-05-06T12:04:00Z'));
+
+        expect(statistics.getSuggestedDifficulty(64)).toEqual({
+            difficulty: 64,
+            reason: 'abandoned',
+        });
+    });
+
+    it('should restart the idle clock after a share', async () => {
+        await statistics.addShares(client, 64);
+        jest.setSystemTime(new Date('2026-05-06T12:00:30Z'));
+        expect(statistics.getSuggestedDifficulty(64)).toBeNull();
+
+        jest.setSystemTime(new Date('2026-05-06T12:01:31Z'));
+        expect(statistics.getSuggestedDifficulty(64)).toEqual({
+            difficulty: 8,
+            reason: 'idle',
+        });
+    });
     it('should increase difficulty for rapid submissions', async () => {
         for (let i = 0; i < 5; i++) {
             jest.setSystemTime(new Date(Date.parse('2026-05-06T12:00:00Z') + (i * 1000)));

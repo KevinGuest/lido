@@ -154,14 +154,22 @@ export class AppController {
   public async network() {
     const miningInfo = await firstValueFrom(this.bitcoinRpcService.newBlock$);
     const chainInfo = await this.bitcoinRpcService.getBlockchainInfo();
+    const tipHeight = miningInfo?.blocks ?? chainInfo?.blocks ?? null;
+    // Skip epoch math while IBD — headers/timestamps are incomplete.
+    const difficultyAdjustment =
+      chainInfo?.initialblockdownload ||
+      (chainInfo?.verificationprogress != null && chainInfo.verificationprogress < 0.999)
+        ? null
+        : await this.bitcoinRpcService.getDifficultyAdjustment(tipHeight ?? undefined);
     // UI expects `height`; bitcoind getmininginfo uses `blocks`.
     // headers / verificationprogress come from getblockchaininfo (IBD).
     return {
       ...miningInfo,
-      height: miningInfo?.blocks,
+      height: tipHeight,
       headers: chainInfo?.headers ?? null,
       verificationprogress: chainInfo?.verificationprogress ?? null,
       initialblockdownload: chainInfo?.initialblockdownload ?? null,
+      difficultyAdjustment,
     };
   }
 

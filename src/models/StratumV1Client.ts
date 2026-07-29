@@ -47,6 +47,8 @@ export class StratumV1Client {
     private statistics: StratumV1ClientStatistics;
     private stratumInitialized = false;
     private usedSuggestedDifficulty = false;
+    /** At most one idle "struggling" alert per session — zombies get kicked instead. */
+    private idleStruggleNotified = false;
     private sessionDifficulty: number = 100000;
 
     private entity: ClientEntity;
@@ -503,9 +505,17 @@ export class StratumV1Client {
                     this.clientAuthorization.worker,
                     this.extraNonceAndSessionId,
                 );
-                // Only alert for first-seen workers — reconnects after update are noise.
+                // First-seen → connect. Known worker after disconnect → reconnect
+                // (reconnect no-ops on app update — no prior disconnect this process).
                 if (!returningWorker) {
                     void this.notificationService.notifyMinerConnected(
+                        this.clientAuthorization.worker,
+                        this.clientAuthorization.address,
+                        'sv1',
+                        this.entity?.userAgent || this.clientSubscription?.userAgent,
+                    );
+                } else {
+                    void this.notificationService.notifyMinerReconnected(
                         this.clientAuthorization.worker,
                         this.clientAuthorization.address,
                         'sv1',
@@ -722,6 +732,17 @@ export class StratumV1Client {
         if (suggestion == null) {
             return;
         }
+
+        // Half-open / moved-away miner: drop session → disconnect alert, not struggle spam.
+        if (suggestion.reason === 'abandoned') {
+            console.log(
+                `Abandoning idle client ${this.extraNonceAndSessionId} `
+                + `(no shares; likely left without clean disconnect)`,
+            );
+            this.closeSocket();
+            return;
+        }
+
         const targetDiff = suggestion.difficulty;
 
         if (targetDiff != this.sessionDifficulty) {
@@ -729,7 +750,12 @@ export class StratumV1Client {
             //console.log(`Adjusting ${this.extraNonceAndSessionId} difficulty from ${this.sessionDifficulty} to ${targetDiff}`);
             this.sessionDifficulty = targetDiff;
 
-            if (suggestion.reason === 'idle' && targetDiff < previous) {
+            if (
+                suggestion.reason === 'idle' &&
+                targetDiff < previous &&
+                !this.idleStruggleNotified
+            ) {
+                this.idleStruggleNotified = true;
                 void this.notificationService.notifyMinerStruggling(
                     this.clientAuthorization?.worker || this.entity?.clientName || 'unknown',
                     this.clientAuthorization?.address || this.entity?.address || '',
