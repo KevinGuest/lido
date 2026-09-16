@@ -63,6 +63,10 @@ const DEFAULT_MIN_DIFFICULTY = 0.001;
 const DEFAULT_TARGET_SHARES_PER_MINUTE = 2;
 const DEFAULT_MAX_SOCKET_BUFFER_BYTES = 256 * 1024;
 const DEFAULT_SOCKET_WRITE_TIMEOUT_MS = 2_000;
+/** Cap duplicate-share set so long-lived sessions cannot grow forever. */
+const MAX_SUBMISSION_HASHES = 10_000;
+/** Keep a bounded window of recent jobs per channel across mempool refreshes. */
+const MAX_CHANNEL_JOBS = 32;
 const BIP320_CONSENSUS_VERSION_MASK = 0xe0001fff;
 
 interface ChannelJobState {
@@ -123,6 +127,8 @@ export class StratumV2Client {
     private readonly backgroundWork: NodeJS.Timeout[] = [];
     private lastSentMiningJobTimestamp: number | null = null;
     private readonly targetSharesPerMinute: number;
+    /** Serialize inbound Noise/frame handling across concurrent `data` events. */
+    private inboundChain: Promise<void> = Promise.resolve();
 
     constructor(
         private readonly socket: Socket,
@@ -143,7 +149,7 @@ export class StratumV2Client {
         this.targetSharesPerMinute = this.getTargetSharesPerMinute();
 
         this.socket.on('data', (data: Buffer) => {
-            void this.handleSocketData(data);
+            this.enqueueInbound(data);
         });
 
         this.backgroundWork.push(
@@ -152,7 +158,19 @@ export class StratumV2Client {
             }, 60 * 1000),
         );
 
-        void this.handleSocketData(firstChunk);
+        this.enqueueInbound(firstChunk);
+    }
+
+    private enqueueInbound(data: Buffer): void {
+        if (this.destroyed) {
+            return;
+        }
+        this.inboundChain = this.inboundChain
+            .then(() => this.handleSocketData(data))
+            .catch((error) => {
+                console.error(`[SV2 ${this.sessionId}] ${(error as Error).message}`);
+                this.closeSocket();
+            });
     }
 
     public async destroy(): Promise<void> {
@@ -168,6 +186,7 @@ export class StratumV2Client {
             this.stratumV2Service.releaseExtranoncePrefix(channel.channelId);
         }
         this.channels.clear();
+        this.submissionHashes.clear();
         this.stratumV2Service.unregisterClient(this);
         if (this.entity?.sessionId != null) {
             if (this.entity.address && this.entity.clientName) {
@@ -178,7 +197,14 @@ export class StratumV2Client {
                     'sv2',
                 );
             }
-            await this.clientService.delete(this.entity.sessionId);
+            try {
+                await this.clientService.delete(this.entity.sessionId);
+            } catch (error) {
+                console.error(`[SV2 ${this.sessionId}] Failed to soft-delete session`, error);
+            }
+        }
+        if (!this.socket.destroyed) {
+            this.socket.destroy();
         }
     }
 
@@ -558,7 +584,7 @@ export class StratumV2Client {
             );
             return;
         }
-        this.submissionHashes.add(submissionKey);
+        this.rememberSubmission(submissionKey);
 
         const jobVersion = jobState.jobTemplate.block.version >>> 0;
         const submitVersion = submission.version >>> 0;
@@ -737,7 +763,7 @@ export class StratumV2Client {
             );
             return;
         }
-        this.submissionHashes.add(submissionKey);
+        this.rememberSubmission(submissionKey);
 
         const coinbaseTxBytes = Buffer.concat([
             jobState.coinbasePrefix,
@@ -1017,6 +1043,7 @@ export class StratumV2Client {
 
         if (sendPrevHash || jobTemplate.blockData.clearJobs) {
             channel.jobs.clear();
+            this.submissionHashes.clear();
         }
 
         channel.jobs.set(jobId, {
@@ -1027,6 +1054,7 @@ export class StratumV2Client {
             nBits: jobTemplate.block.bits >>> 0,
             prevHash: Buffer.from(jobTemplate.block.prevHash),
         });
+        this.trimChannelJobs(channel);
 
         await this.sendFrame(
             Sv2MsgType.NEW_MINING_JOB,
@@ -1095,6 +1123,7 @@ export class StratumV2Client {
 
         if (sendPrevHash || jobTemplate.blockData.clearJobs) {
             channel.jobs.clear();
+            this.submissionHashes.clear();
         }
 
         channel.jobs.set(jobId, {
@@ -1107,6 +1136,7 @@ export class StratumV2Client {
             coinbaseSuffix,
             merklePath,
         });
+        this.trimChannelJobs(channel);
 
         await this.sendFrame(
             Sv2MsgType.NEW_EXTENDED_MINING_JOB,
@@ -1158,6 +1188,23 @@ export class StratumV2Client {
         return jobId;
     }
 
+    private rememberSubmission(submissionKey: string): void {
+        if (this.submissionHashes.size >= MAX_SUBMISSION_HASHES) {
+            this.submissionHashes.clear();
+        }
+        this.submissionHashes.add(submissionKey);
+    }
+
+    private trimChannelJobs(channel: ChannelState): void {
+        while (channel.jobs.size > MAX_CHANNEL_JOBS) {
+            const oldestJobId = channel.jobs.keys().next().value;
+            if (oldestJobId == null) {
+                break;
+            }
+            channel.jobs.delete(oldestJobId);
+        }
+    }
+
     private async checkDifficulty(): Promise<void> {
         if (this.destroyed || this.channels.size === 0) {
             return;
@@ -1177,12 +1224,9 @@ export class StratumV2Client {
             if (suggestion.reason === 'abandoned') {
                 console.log(
                     `[SV2 ${this.sessionId}] Abandoning idle session `
-                    + `(no shares; likely left without clean disconnect)`,
+                    + `(no share activity; likely left without clean disconnect)`,
                 );
-                await this.destroy();
-                if (!this.socket.destroyed) {
-                    this.socket.destroy();
-                }
+                this.closeSocket();
                 return;
             }
 
@@ -1506,9 +1550,7 @@ export class StratumV2Client {
     }
 
     private closeSocket(): void {
-        if (!this.socket.destroyed) {
-            this.socket.destroy();
-        }
+        // destroy() is idempotent and always tears down the TCP socket.
         void this.destroy();
     }
 }

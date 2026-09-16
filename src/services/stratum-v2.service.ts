@@ -29,7 +29,7 @@ import { BitcoinRpcService } from './bitcoin-rpc.service';
 import { NotificationService } from './notification.service';
 import { IJobTemplate, StratumV1JobsService } from './stratum-v1-jobs.service';
 
-const DEFAULT_SOCKET_TIMEOUT_MS = 1000 * 60 * 60;
+const DEFAULT_SOCKET_TIMEOUT_MS = 1000 * 60 * 5;
 const DEFAULT_TCP_KEEPALIVE_INITIAL_DELAY_MS = 1000 * 60;
 
 /**

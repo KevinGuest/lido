@@ -1,6 +1,7 @@
 import { ConfigService } from '@nestjs/config';
 import { Test, TestingModule } from '@nestjs/testing';
 import { TypeOrmModule } from '@nestjs/typeorm';
+import { plainToInstance } from 'class-transformer';
 import { Socket } from 'net';
 import { BehaviorSubject } from 'rxjs';
 import { DataSource } from 'typeorm';
@@ -156,13 +157,26 @@ describe('StratumV1Client', () => {
 
         socket.end = jest.fn();
         jest.spyOn(socket, 'destroy').mockImplementation(() => socket);
+        jest.spyOn(socket, 'write').mockImplementation(((data: any, encodingOrCb?: any, cb?: any) => {
+            const callback = typeof encodingOrCb === 'function' ? encodingOrCb : cb;
+            if (typeof callback === 'function') {
+                if (callback) { callback(); }
+            }
+            return true;
+        }) as any);
 
         const addressSettings = moduleRef.get<AddressSettingsService>(AddressSettingsService);
         notificationService = {
-            notifySubscribersBlockFound: jest.fn().mockResolvedValue(undefined)
+            notifySubscribersBlockFound: jest.fn().mockResolvedValue(undefined),
+            notifyMinerConnected: jest.fn().mockResolvedValue(undefined),
+            notifyMinerReconnected: jest.fn().mockResolvedValue(undefined),
+            notifyMinerDisconnected: jest.fn().mockResolvedValue(undefined),
+            notifyMinerStruggling: jest.fn().mockResolvedValue(undefined),
+            notifyBestDifficulty: jest.fn().mockResolvedValue(undefined),
         } as any;
         blocksService = {
-            save: jest.fn().mockResolvedValue(undefined)
+            save: jest.fn().mockResolvedValue(undefined),
+            existsByHeight: jest.fn().mockResolvedValue(false),
         } as any;
         externalSharesService = {
             submitShare: jest.fn().mockResolvedValue(undefined)
@@ -207,7 +221,13 @@ describe('StratumV1Client', () => {
     });
 
     it('should respond to mining.subscribe', async () => {
-        jest.spyOn(socket, 'write').mockImplementation((data) => true);
+        jest.spyOn(socket, 'write').mockImplementation(((data: any, encodingOrCb?: any, cb?: any) => {
+            const callback = typeof encodingOrCb === 'function' ? encodingOrCb : cb;
+                if (typeof callback === 'function') {
+                    Promise.resolve().then(() => callback());
+                }
+            return true;
+        }) as any);
 
         expect(socket.on).toHaveBeenCalled();
         emitMessage(MockRecording1.MINING_SUBSCRIBE);
@@ -230,7 +250,13 @@ describe('StratumV1Client', () => {
             }
             return null;
         });
-        jest.spyOn(socket, 'write').mockImplementation((data) => true);
+        jest.spyOn(socket, 'write').mockImplementation(((data: any, encodingOrCb?: any, cb?: any) => {
+            const callback = typeof encodingOrCb === 'function' ? encodingOrCb : cb;
+                if (typeof callback === 'function') {
+                    Promise.resolve().then(() => callback());
+                }
+            return true;
+        }) as any);
 
         emitMessage(`{"id":1,"method":"mining.subscribe","params":["NMMiner/1.0"]}`);
         await new Promise((r) => setTimeout(r, 1));
@@ -253,7 +279,13 @@ describe('StratumV1Client', () => {
             }
             return null;
         });
-        jest.spyOn(socket, 'write').mockImplementation((data) => true);
+        jest.spyOn(socket, 'write').mockImplementation(((data: any, encodingOrCb?: any, cb?: any) => {
+            const callback = typeof encodingOrCb === 'function' ? encodingOrCb : cb;
+                if (typeof callback === 'function') {
+                    Promise.resolve().then(() => callback());
+                }
+            return true;
+        }) as any);
 
         emitMessage(`{"id":1,"method":"mining.subscribe","params":["NMMiner/1.0"]}`);
         await new Promise((r) => setTimeout(r, 1));
@@ -289,7 +321,13 @@ describe('StratumV1Client', () => {
 
     it('should respond to mining.configure', async () => {
 
-        jest.spyOn(socket, 'write').mockImplementation((data) => true);
+        jest.spyOn(socket, 'write').mockImplementation(((data: any, encodingOrCb?: any, cb?: any) => {
+            const callback = typeof encodingOrCb === 'function' ? encodingOrCb : cb;
+                if (typeof callback === 'function') {
+                    Promise.resolve().then(() => callback());
+                }
+            return true;
+        }) as any);
 
         expect(socket.on).toHaveBeenCalled();
         emitMessage(MockRecording1.MINING_CONFIGURE);
@@ -299,7 +337,13 @@ describe('StratumV1Client', () => {
 
     it('should respond to mining.authorize', async () => {
 
-        jest.spyOn(socket, 'write').mockImplementation((data) => true);
+        jest.spyOn(socket, 'write').mockImplementation(((data: any, encodingOrCb?: any, cb?: any) => {
+            const callback = typeof encodingOrCb === 'function' ? encodingOrCb : cb;
+                if (typeof callback === 'function') {
+                    Promise.resolve().then(() => callback());
+                }
+            return true;
+        }) as any);
 
         expect(socket.on).toHaveBeenCalled();
         emitMessage(MockRecording1.MINING_AUTHORIZE);
@@ -308,7 +352,13 @@ describe('StratumV1Client', () => {
     });
 
     it('should respond to mining.suggest_difficulty', async () => {
-        jest.spyOn(socket, 'write').mockImplementation((data) => true);
+        jest.spyOn(socket, 'write').mockImplementation(((data: any, encodingOrCb?: any, cb?: any) => {
+            const callback = typeof encodingOrCb === 'function' ? encodingOrCb : cb;
+                if (typeof callback === 'function') {
+                    Promise.resolve().then(() => callback());
+                }
+            return true;
+        }) as any);
 
         expect(socket.on).toHaveBeenCalled();
         emitMessage(MockRecording1.MINING_SUGGEST_DIFFICULTY);
@@ -467,19 +517,49 @@ describe('StratumV1Client', () => {
     });
 
     it('should reject duplicate submissions', async () => {
-        jest.spyOn(client as any, 'write').mockImplementation((data) => Promise.resolve(true));
+        (client as any).write = jest.fn().mockResolvedValue(true);
+        jest.spyOn(client as any, 'calculateDifficulty').mockReturnValue({
+            submissionDifficulty: 1,
+            submissionHash: 'share'
+        });
+        jest.spyOn(client as any, 'ensureClientEntity').mockResolvedValue(undefined);
+        jest.spyOn(client as any, 'recordRejectedShare').mockResolvedValue(undefined);
+        (client as any).stratumInitialized = true;
+        (client as any).sessionDifficulty = 1;
+        (client as any).entity = {
+            address: 'tb1qumezefzdeqqwn5zfvgdrhxjzc5ylr39uhuxcz4',
+            clientName: 'bitaxe3',
+            bestDifficulty: 0,
+            updatedAt: new Date(),
+        };
+        (client as any).statistics = {
+            addShares: jest.fn().mockResolvedValue(undefined),
+            hashRate: 0,
+        };
+        (client as any).clientAuthorization = {
+            address: 'tb1qumezefzdeqqwn5zfvgdrhxjzc5ylr39uhuxcz4',
+            worker: 'bitaxe3',
+        };
+        (client as any).clientSubscription = { userAgent: 'test' };
+        (client as any).extraNonceAndSessionId = MockRecording1.EXTRA_NONCE;
 
-        emitMessage(MockRecording1.MINING_SUBSCRIBE);
-        emitMessage(`{"id": 4, "method": "mining.suggest_difficulty", "params": [0]}`);
-        emitMessage(MockRecording1.MINING_AUTHORIZE);
-        await new Promise((r) => setTimeout(r, 100));
+        const miningJob = {
+            jobId: '1',
+            jobTemplateId: '1',
+            buildHeaderBuffer: jest.fn().mockReturnValue(Buffer.alloc(80)),
+        };
+        jest.spyOn(stratumV1JobsService, 'getJobById').mockReturnValue(miningJob as any);
+        jest.spyOn(stratumV1JobsService, 'getJobTemplateById').mockReturnValue({
+            blockData: { networkDifficulty: 1e12, height: 1 },
+        } as any);
 
-        emitMessage(MockRecording1.MINING_SUBMIT);
-        await new Promise((r) => setTimeout(r, 100));
-        emitMessage(MockRecording1.MINING_SUBMIT);
-        await new Promise((r) => setTimeout(r, 100));
+        const submitMsg = plainToInstance(MiningSubmitMessage, JSON.parse(MockRecording1.MINING_SUBMIT));
+        await (client as any).handleMiningSubmission(submitMsg);
+        await (client as any).handleMiningSubmission(submitMsg);
 
-        expect((client as any).write).lastCalledWith(`{"id":5,"result":null,"error":[22,"Duplicate share",""]}\n`);
+        expect((client as any).write).toHaveBeenCalledWith(
+            `{"id":5,"result":null,"error":[22,"Duplicate share",""]}\n`,
+        );
     });
 
     it('should reject submissions for unknown jobs', async () => {

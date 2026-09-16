@@ -1,4 +1,4 @@
-import { BehaviorSubject, firstValueFrom } from 'rxjs';
+import { BehaviorSubject, firstValueFrom, skip } from 'rxjs';
 
 import { MockRecording1 } from '../../test/models/MockRecording1';
 import { IMiningInfo } from '../models/bitcoin-rpc/IMiningInfo';
@@ -33,6 +33,7 @@ describe('StratumV1JobsService', () => {
     });
 
     afterEach(() => {
+        (service as any).pipelineKeepAlive?.unsubscribe();
         consoleLogSpy.mockRestore();
         jest.useRealTimers();
     });
@@ -55,7 +56,8 @@ describe('StratumV1JobsService', () => {
         const firstTemplate = await firstValueFrom(service.newMiningJob$);
         service.addJob({ jobId: 'old-job', creation: Date.now() } as any);
 
-        const nextTemplate = firstValueFrom(service.newMiningJob$);
+        // Pipeline stays hot via keep-alive — skip the replayed template.
+        const nextTemplate = firstValueFrom(service.newMiningJob$.pipe(skip(1)));
         miningInfo$.next({
             blocks: MockRecording1.BLOCK_TEMPLATE.height + 1
         } as IMiningInfo);
@@ -115,7 +117,7 @@ describe('StratumV1JobsService', () => {
         } as any;
 
         jest.setSystemTime(new Date(Date.now() + (1000 * 60 * 11)));
-        const nextTemplate = firstValueFrom(service.newMiningJob$);
+        const nextTemplate = firstValueFrom(service.newMiningJob$.pipe(skip(1)));
         miningInfo$.next({
             blocks: MockRecording1.BLOCK_TEMPLATE.height
         } as IMiningInfo);

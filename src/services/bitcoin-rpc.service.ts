@@ -24,6 +24,10 @@ type RpcBlockHeader = {
 };
 
 const DIFFICULTY_ADJ_CACHE_MS = 30_000;
+/** Bound cluster lock waits so a stuck peer cannot hang the shared job pipeline forever. */
+const WAIT_FOR_BLOCK_TIMEOUT_MS = 30_000;
+const LOAD_BLOCK_TEMPLATE_TIMEOUT_MS = 30_000;
+const ZMQ_RECONNECT_DELAY_MS = 5_000;
 
 @Injectable()
 export class BitcoinRpcService implements OnModuleInit {
@@ -79,21 +83,8 @@ export class BitcoinRpcService implements OnModuleInit {
 
         if (this.configService.get('BITCOIN_ZMQ_HOST')) {
             console.log('Using ZMQ');
-            const sock = new zmq.Subscriber;
-
-
-            sock.connectTimeout = 1000;
-            sock.events.on('connect', () => {
-                console.log('ZMQ Connected');
-            });
-            sock.events.on('connect:retry', () => {
-                console.log('ZMQ Unable to connect, Retrying');
-            });
-
-            sock.connect(this.configService.get('BITCOIN_ZMQ_HOST'));
-            sock.subscribe('rawblock');
-            // Don't await this, otherwise it will block the rest of the program
-            this.listenForNewBlocks(sock);
+            // Don't await — reconnect loop runs for process lifetime.
+            void this.runZmqListener();
             await this.pollMiningInfo();
 
         } else {
@@ -101,8 +92,37 @@ export class BitcoinRpcService implements OnModuleInit {
         }
     }
 
+    private async runZmqListener(): Promise<void> {
+        while (true) {
+            const sock = new zmq.Subscriber;
+            try {
+                sock.connectTimeout = 1000;
+                sock.events.on('connect', () => {
+                    console.log('ZMQ Connected');
+                });
+                sock.events.on('connect:retry', () => {
+                    console.log('ZMQ Unable to connect, Retrying');
+                });
+
+                sock.connect(this.configService.get('BITCOIN_ZMQ_HOST'));
+                sock.subscribe('rawblock');
+                await this.listenForNewBlocks(sock);
+                console.warn('ZMQ subscription ended; reconnecting');
+            } catch (e) {
+                console.error('ZMQ listener error:', (e as Error).message);
+            } finally {
+                try {
+                    sock.close();
+                } catch {
+                    // ignore close races
+                }
+            }
+            await new Promise(r => setTimeout(r, ZMQ_RECONNECT_DELAY_MS));
+        }
+    }
+
     private async listenForNewBlocks(sock: zmq.Subscriber) {
-        for await (const [topic, msg] of sock) {
+        for await (const [_topic, _msg] of sock) {
             console.log("New Block");
             await this.pollMiningInfo();
         }
@@ -118,7 +138,8 @@ export class BitcoinRpcService implements OnModuleInit {
     }
 
     private async waitForBlock(blockHeight: number): Promise<IBlockTemplate> {
-        while (true) {
+        const deadline = Date.now() + WAIT_FOR_BLOCK_TIMEOUT_MS;
+        while (Date.now() < deadline) {
             await new Promise(r => setTimeout(r, 100));
 
             const block = await this.rpcBlockService.getBlock(blockHeight);
@@ -128,6 +149,7 @@ export class BitcoinRpcService implements OnModuleInit {
             }
             console.log(`promise loop, block height ${blockHeight}`);
         }
+        throw new Error(`Timed out waiting for block template at height ${blockHeight}`);
     }
 
     public async getBlockTemplate(blockHeight: number): Promise<IBlockTemplate> {
@@ -167,7 +189,11 @@ export class BitcoinRpcService implements OnModuleInit {
     private async loadBlockTemplate(blockHeight: number) {
 
         let blockTemplate: IBlockTemplate;
+        const deadline = Date.now() + LOAD_BLOCK_TEMPLATE_TIMEOUT_MS;
         while (blockTemplate == null) {
+            if (Date.now() >= deadline) {
+                throw new Error(`Timed out loading block template at height ${blockHeight}`);
+            }
             blockTemplate = await this.callRpc<IBlockTemplate>('getblocktemplate', [
                 {
                     rules: ['segwit'],
@@ -175,6 +201,9 @@ export class BitcoinRpcService implements OnModuleInit {
                     capabilities: ['serverlist', 'proposal']
                 }
             ]);
+            if (blockTemplate == null) {
+                await new Promise(r => setTimeout(r, 250));
+            }
         }
 
 

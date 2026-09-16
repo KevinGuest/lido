@@ -32,6 +32,12 @@ import { ExternalSharesService } from '../services/external-shares.service';
 const TRUE_DIFF_ONE = 2.695953529101131e67;
 const BLOCKED_USER_AGENT_LOG_INTERVAL_MS = 60 * 1000;
 const VALIDATION_ERROR_LOG_INTERVAL_MS = 60 * 1000;
+/** Cap duplicate-share set so long blocks / stalled tips cannot grow forever. */
+const MAX_SUBMISSION_HASHES = 10_000;
+/** Drop connections that send a huge incomplete line (DoS / corrupt client). */
+const MAX_INBOUND_BUFFER_CHARS = 256 * 1024;
+const MAX_SOCKET_BUFFER_BYTES = 256 * 1024;
+const SOCKET_WRITE_TIMEOUT_MS = 10_000;
 
 export class StratumV1Client {
     private static blockedUserAgentLogState = new Map<string, { nextLogAt: number, suppressed: number }>();
@@ -61,9 +67,15 @@ export class StratumV1Client {
 
     private buffer: string = '';
     private connectionClosed = false;
+    private destroyed = false;
     private lastSentMiningJobTimestamp: number = null;
+    /** Serialize inbound JSON-RPC handling so concurrent `data` chunks cannot race. */
+    private inboundChain: Promise<void> = Promise.resolve();
+    private pendingSocketWriteBytes = 0;
 
     private miningSubmissionHashes = new Set<string>()
+    /** Height at which miningSubmissionHashes was last cleared (same tip → keep dup set). */
+    private submissionHashResetHeight: number | null = null;
 
     constructor(
         public readonly socket: Socket,
@@ -79,49 +91,95 @@ export class StratumV1Client {
     ) {
 
         this.socket.on('data', (data: Buffer) => {
-            this.buffer += data.toString();
-            let lines = this.buffer.split('\n');
-            this.buffer = lines.pop() || ''; // Save the last part of the data (incomplete line) to the buffer
+            if (this.connectionClosed || this.destroyed) {
+                return;
+            }
 
-            (async () => {
-                for (const m of lines.filter(l => l.length > 0)) {
-                    if (this.connectionClosed || this.socket.destroyed || this.socket.writableEnded) {
-                        break;
+            this.buffer += data.toString();
+            if (this.buffer.length > MAX_INBOUND_BUFFER_CHARS) {
+                console.error(
+                    `Inbound buffer overflow (${this.buffer.length} chars) `
+                    + `from ${this.extraNonceAndSessionId ?? 'uninitialized'}; closing`,
+                );
+                this.closeSocket();
+                return;
+            }
+
+            const lines = this.buffer.split('\n');
+            this.buffer = lines.pop() || '';
+
+            const completeLines = lines.filter(l => l.length > 0);
+            if (completeLines.length === 0) {
+                return;
+            }
+
+            this.inboundChain = this.inboundChain
+                .then(async () => {
+                    for (const m of completeLines) {
+                        if (this.connectionClosed || this.destroyed || this.socket.destroyed || this.socket.writableEnded) {
+                            break;
+                        }
+                        try {
+                            await this.handleMessage(m);
+                        } catch (e) {
+                            console.error(e);
+                            this.closeSocket();
+                            break;
+                        }
                     }
-                    try {
-                        await this.handleMessage(m);
-                    } catch (e) {
-                        await this.socket.end();
-                        console.error(e);
-                    }
-                }
-            })();
+                })
+                .catch((e) => {
+                    console.error(e);
+                    this.closeSocket();
+                });
         });
 
 
     }
 
     public async destroy() {
-
-        if (this.extraNonceAndSessionId) {
-            if (this.entity?.address && this.entity?.clientName) {
-                void this.notificationService.notifyMinerDisconnected(
-                    this.entity.clientName,
-                    this.entity.address,
-                    this.entity.userAgent,
-                    'sv1',
-                );
-            }
-            await this.clientService.delete(this.extraNonceAndSessionId);
+        if (this.destroyed) {
+            return;
         }
-
-        if (this.stratumSubscription != null) {
-            this.stratumSubscription.unsubscribe();
-        }
+        this.destroyed = true;
+        this.connectionClosed = true;
 
         this.backgroundWork.forEach(work => {
             clearInterval(work);
         });
+        this.backgroundWork.length = 0;
+
+        if (this.stratumSubscription != null) {
+            this.stratumSubscription.unsubscribe();
+            this.stratumSubscription = null;
+        }
+
+        this.miningSubmissionHashes.clear();
+        this.submissionHashResetHeight = null;
+
+        if (this.extraNonceAndSessionId) {
+            if (this.entity?.address && this.entity?.clientName) {
+                try {
+                    void this.notificationService.notifyMinerDisconnected(
+                        this.entity.clientName,
+                        this.entity.address,
+                        this.entity.userAgent,
+                        'sv1',
+                    );
+                } catch (e) {
+                    console.error(`Disconnect notify failed for ${this.extraNonceAndSessionId}`, e);
+                }
+            }
+            try {
+                await this.clientService.delete(this.extraNonceAndSessionId);
+            } catch (e) {
+                console.error(`Failed to soft-delete session ${this.extraNonceAndSessionId}`, e);
+            }
+        }
+
+        if (!this.socket.destroyed) {
+            this.socket.destroy();
+        }
     }
 
     private getRandomHexString() {
@@ -137,9 +195,9 @@ export class StratumV1Client {
         let parsedMessage = null;
         try {
             parsedMessage = JSON.parse(message);
-        } catch (e) {
+            } catch (e) {
             //console.log("Invalid JSON");
-            await this.socket.end();
+            this.closeSocket();
             return;
         }
 
@@ -401,24 +459,48 @@ export class StratumV1Client {
             }
         }
 
-        this.stratumSubscription = this.stratumV1JobsService.newMiningJob$.subscribe(async (jobTemplate) => {
-            try {
-                if(jobTemplate.blockData.clearJobs){
-                    this.miningSubmissionHashes.clear();
-                }
-                await this.sendNewMiningJob(jobTemplate);
-            } catch (e) {
-                await this.socket.end();
-                console.error(e);
-            }
+        this.stratumSubscription = this.stratumV1JobsService.newMiningJob$.subscribe({
+            next: (jobTemplate) => {
+                // Jobs stay off the inbound queue (MiningJob build can be heavy); share
+                // state mutations are still serialized via resetSubmissionHashesIfNewBlock.
+                Promise.resolve()
+                    .then(async () => {
+                        if (this.destroyed || this.connectionClosed) {
+                            return;
+                        }
+                        this.resetSubmissionHashesIfNewBlock(jobTemplate);
+                        await this.sendNewMiningJob(jobTemplate);
+                    })
+                    .catch((e) => {
+                        console.error(e);
+                        this.closeSocket();
+                    });
+            },
+            error: (e) => {
+                console.error(`Job stream error for ${this.extraNonceAndSessionId}`, e);
+                this.closeSocket();
+            },
         });
 
         this.backgroundWork.push(
-            setInterval(async () => {
-                await this.checkDifficulty();
+            setInterval(() => {
+                Promise.resolve().then(() => this.checkDifficulty());
             }, 60 * 1000)
         );
 
+    }
+
+    private resetSubmissionHashesIfNewBlock(jobTemplate: IJobTemplate): void {
+        if (!jobTemplate.blockData.clearJobs) {
+            return;
+        }
+        // Only wipe the dup set on a real tip change. Replaying clearJobs for the
+        // same height (subscribe replay / difficulty refresh) must not forget shares.
+        if (this.submissionHashResetHeight === jobTemplate.blockData.height) {
+            return;
+        }
+        this.miningSubmissionHashes.clear();
+        this.submissionHashResetHeight = jobTemplate.blockData.height;
     }
 
     private async sendNewMiningJob(jobTemplate: IJobTemplate) {
@@ -508,19 +590,27 @@ export class StratumV1Client {
                 // First-seen → connect. Known worker after disconnect → reconnect
                 // (reconnect no-ops on app update — no prior disconnect this process).
                 if (!returningWorker) {
-                    void this.notificationService.notifyMinerConnected(
-                        this.clientAuthorization.worker,
-                        this.clientAuthorization.address,
-                        'sv1',
-                        this.entity?.userAgent || this.clientSubscription?.userAgent,
-                    );
+                    try {
+                        void this.notificationService.notifyMinerConnected(
+                            this.clientAuthorization.worker,
+                            this.clientAuthorization.address,
+                            'sv1',
+                            this.entity?.userAgent || this.clientSubscription?.userAgent,
+                        );
+                    } catch (e) {
+                        console.error('Connect notify failed', e);
+                    }
                 } else {
-                    void this.notificationService.notifyMinerReconnected(
-                        this.clientAuthorization.worker,
-                        this.clientAuthorization.address,
-                        'sv1',
-                        this.entity?.userAgent || this.clientSubscription?.userAgent,
-                    );
+                    try {
+                        void this.notificationService.notifyMinerReconnected(
+                            this.clientAuthorization.worker,
+                            this.clientAuthorization.address,
+                            'sv1',
+                            this.entity?.userAgent || this.clientSubscription?.userAgent,
+                        );
+                    } catch (e) {
+                        console.error('Reconnect notify failed', e);
+                    }
                 }
             })();
         }
@@ -581,6 +671,9 @@ export class StratumV1Client {
             await this.recordRejectedShare();
             return false;
         } else {
+            if (this.miningSubmissionHashes.size >= MAX_SUBMISSION_HASHES) {
+                this.miningSubmissionHashes.clear();
+            }
             this.miningSubmissionHashes.add(submissionHash);
         }
 
@@ -728,6 +821,10 @@ export class StratumV1Client {
     }
 
     private async checkDifficulty() {
+        if (this.destroyed || this.connectionClosed || this.statistics == null) {
+            return;
+        }
+
         const suggestion = this.statistics.getSuggestedDifficulty(this.sessionDifficulty);
         if (suggestion == null) {
             return;
@@ -737,7 +834,7 @@ export class StratumV1Client {
         if (suggestion.reason === 'abandoned') {
             console.log(
                 `Abandoning idle client ${this.extraNonceAndSessionId} `
-                + `(no shares; likely left without clean disconnect)`,
+                + `(no share activity; likely left without clean disconnect)`,
             );
             this.closeSocket();
             return;
@@ -773,9 +870,18 @@ export class StratumV1Client {
             }) + '\n';
 
 
-            await this.socket.write(data);
+            const written = await this.write(data);
+            if (!written) {
+                return;
+            }
 
-            const jobTemplate = await firstValueFrom(this.stratumV1JobsService.newMiningJob$);
+            let jobTemplate: IJobTemplate;
+            try {
+                jobTemplate = await firstValueFrom(this.stratumV1JobsService.newMiningJob$);
+            } catch (e) {
+                console.error(`Failed to fetch job template for difficulty change: ${this.extraNonceAndSessionId}`, e);
+                return;
+            }
             const nextTimestamp = Math.max(
                 jobTemplate.block.timestamp,
                 Math.floor(Date.now() / 1000),
@@ -898,39 +1004,69 @@ export class StratumV1Client {
         if (!this.socket.destroyed) {
             this.socket.destroy();
         }
+        void this.destroy();
     }
 
     private async write(message: string): Promise<boolean> {
         try {
-            if (!this.socket.destroyed && !this.socket.writableEnded) {
+            if (this.destroyed || this.connectionClosed || this.socket.destroyed || this.socket.writableEnded) {
+                void this.destroy();
+                return false;
+            }
 
-                await new Promise((resolve, reject) => {
-                    this.socket.write(message, (error) => {
+            const payloadBytes = Buffer.byteLength(message);
+            const socketBufferedBytes = Number.isFinite(this.socket.writableLength)
+                ? this.socket.writableLength
+                : 0;
+            const bufferedBytes = Math.max(socketBufferedBytes, this.pendingSocketWriteBytes);
+            if (bufferedBytes + payloadBytes > MAX_SOCKET_BUFFER_BYTES) {
+                console.error(
+                    `SV1 socket buffer would reach ${bufferedBytes + payloadBytes} bytes `
+                    + `for ${this.extraNonceAndSessionId}; closing`,
+                );
+                this.closeSocket();
+                return false;
+            }
+
+            this.pendingSocketWriteBytes += payloadBytes;
+            try {
+                await new Promise<void>((resolve, reject) => {
+                    let completed = false;
+                    const timer = setTimeout(() => {
+                        finish(new Error(`SV1 socket write timed out after ${SOCKET_WRITE_TIMEOUT_MS}ms`));
+                    }, SOCKET_WRITE_TIMEOUT_MS);
+
+                    const finish = (error?: Error): void => {
+                        if (completed) {
+                            return;
+                        }
+                        completed = true;
+                        clearTimeout(timer);
                         if (error) {
                             reject(error);
                         } else {
-                            resolve(true);
+                            resolve();
+                        }
+                    };
+
+                    const ok = this.socket.write(message, (error?: Error | null) => {
+                        if (error) {
+                            finish(error);
+                        } else {
+                            finish();
                         }
                     });
+                    if (!ok) {
+                        this.socket.once('drain', () => finish());
+                    }
                 });
-
                 return true;
-            } else {
-                console.error(`Error: Cannot write to closed or ended socket. ${this.extraNonceAndSessionId} ${message}`);
-                this.destroy();
-                if (!this.socket.destroyed) {
-                    this.socket.destroy();
-                }
-                return false;
+            } finally {
+                this.pendingSocketWriteBytes = Math.max(0, this.pendingSocketWriteBytes - payloadBytes);
             }
         } catch (error) {
-            this.destroy();
-            if (!this.socket.writableEnded) {
-                await this.socket.end();
-            } else if (!this.socket.destroyed) {
-                this.socket.destroy();
-            }
             console.error(`Error occurred while writing to socket: ${this.extraNonceAndSessionId}`, error);
+            this.closeSocket();
             return false;
         }
     }

@@ -5,11 +5,16 @@ const CACHE_SIZE = 30;
 const TARGET_SUBMISSION_PER_SECOND = 10;
 const MIN_DIFF = 0.00001;
 const SLOT_MS = 1000 * 60 * 10;
-/** No/low shares → try lowering difficulty (real high-diff miner). */
+/** No/low accepted shares → try lowering difficulty (real high-diff miner). */
 const IDLE_AFTER_SEC = 60;
 /**
- * Still quiet after this → treat as gone (half-open TCP after pool switch).
- * Kick the session instead of spamming "miner struggling".
+ * No inbound share activity (accept *or* reject) for this long → treat as gone
+ * (half-open TCP / miner left without clean disconnect).
+ *
+ * Uses activity rather than accepted-only so a miner stuck on stale jobs
+ * (reject storm) is not kicked into a reconnect loop while still talking.
+ * Home/solo WiFi: 3 minutes is enough to clear zombies without false abandons
+ * when shares are still arriving.
  */
 const ABANDON_AFTER_SEC = 180;
 
@@ -22,8 +27,10 @@ export class StratumV1ClientStatistics {
     private rejectedByCode = new Map<string, number>();
 
     private submissionCacheStart: Date;
-    /** Wall time of last accepted share (idle/abandon clock). */
+    /** Wall time of last accepted share (idle vardiff clock). */
     private lastShareAt: Date | null = null;
+    /** Wall time of last accept or reject (abandon / half-open clock). */
+    private lastActivityAt: Date | null = null;
     private submissionCache: { time: Date, difficulty: number }[] = [];
 
     private currentTimeSlot: number = null;
@@ -73,6 +80,7 @@ export class StratumV1ClientStatistics {
             difficulty: targetDifficulty,
         });
         this.lastShareAt = date;
+        this.lastActivityAt = date;
 
         if (this.currentTimeSlot == null) {
             // First record, insert it
@@ -126,6 +134,8 @@ export class StratumV1ClientStatistics {
         }
 
         const date = new Date();
+        // Rejects prove the miner is still live on the socket — do not abandon.
+        this.lastActivityAt = date;
         const timeSlot = this.timeSlot(date);
 
         if (this.currentTimeSlot == null) {
@@ -169,13 +179,18 @@ export class StratumV1ClientStatistics {
         reason: 'idle' | 'vardiff' | 'abandoned';
     } | null {
 
-        // Few/no shares: either difficulty too high (idle lower) or miner left (abandon).
+        // Few/no accepted shares: lower difficulty if quiet on accepts, or abandon if
+        // there has been no share traffic at all (accept or reject).
         if (this.submissionCache.length < 5) {
-            const anchor = this.lastShareAt ?? this.submissionCacheStart;
-            const idleSecs = (new Date().getTime() - anchor.getTime()) / 1000;
-            if (idleSecs > ABANDON_AFTER_SEC) {
+            const nowMs = new Date().getTime();
+            const activityAnchor = this.lastActivityAt ?? this.submissionCacheStart;
+            const quietSecs = (nowMs - activityAnchor.getTime()) / 1000;
+            if (quietSecs > ABANDON_AFTER_SEC) {
                 return { difficulty: clientDifficulty, reason: 'abandoned' };
             }
+
+            const acceptAnchor = this.lastShareAt ?? this.submissionCacheStart;
+            const idleSecs = (nowMs - acceptAnchor.getTime()) / 1000;
             if (idleSecs > IDLE_AFTER_SEC) {
                 const difficulty = this.nearestPowerOfTwo(clientDifficulty / 6);
                 if (difficulty == null) {

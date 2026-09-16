@@ -148,6 +148,36 @@ describe('StratumV1ClientStatistics', () => {
         });
     });
 
+    it('should not abandon a session that is still submitting rejected shares', async () => {
+        jest.setSystemTime(new Date('2026-05-06T12:02:00Z'));
+        await statistics.addRejected(client, 'job-not-found');
+
+        jest.setSystemTime(new Date('2026-05-06T12:04:30Z'));
+        // Still idle on accepts (vardiff lower), but not abandoned — miner is alive.
+        expect(statistics.getSuggestedDifficulty(64)).toEqual({
+            difficulty: 8,
+            reason: 'idle',
+        });
+
+        jest.setSystemTime(new Date('2026-05-06T12:05:01Z'));
+        await statistics.addRejected(client, 'job-not-found');
+        expect(statistics.getSuggestedDifficulty(64)).toEqual({
+            difficulty: 8,
+            reason: 'idle',
+        });
+    });
+
+    it('should abandon only after share activity (accept or reject) goes silent', async () => {
+        jest.setSystemTime(new Date('2026-05-06T12:01:00Z'));
+        await statistics.addRejected(client, 'job-not-found');
+
+        jest.setSystemTime(new Date('2026-05-06T12:04:01Z'));
+        expect(statistics.getSuggestedDifficulty(64)).toEqual({
+            difficulty: 64,
+            reason: 'abandoned',
+        });
+    });
+
     it('should restart the idle clock after a share', async () => {
         await statistics.addShares(client, 64);
         jest.setSystemTime(new Date('2026-05-06T12:00:30Z'));

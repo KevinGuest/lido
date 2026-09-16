@@ -26,6 +26,7 @@ const DEFAULT_BACKPRESSURE_RSS_MB = 2500;
 const DEFAULT_BACKPRESSURE_RESUME_RSS_MB = 2000;
 const DEFAULT_BACKPRESSURE_HEALTHY_CHECKS = 3;
 const DEFAULT_MAX_CONNECTIONS_PER_LISTENER = 10000;
+const DEFAULT_TCP_KEEPALIVE_INITIAL_DELAY_MS = 1000 * 60;
 
 
 @Injectable()
@@ -82,8 +83,10 @@ export class StratumV1Service implements OnModuleInit {
     private createSocketServer(): Server {
         const server = new Server(async (socket: Socket) => {
 
-            //5 min
+            //5 min idle TCP timeout; keepalive detects half-open peers sooner.
             socket.setTimeout(1000 * 60 * 5);
+            socket.setKeepAlive(true, this.getTcpKeepAliveInitialDelayMs());
+            socket.setNoDelay(true);
 
             const client = new StratumV1Client(
                 socket,
@@ -100,20 +103,20 @@ export class StratumV1Service implements OnModuleInit {
 
 
             socket.on('close', async (hadError: boolean) => {
+                // Always tear down client state (intervals / job subscription), even if
+                // the session never finished subscribe (no extraNonce yet).
+                await client.destroy();
                 if (client.extraNonceAndSessionId != null) {
-                    // Handle socket disconnection
-                    await client.destroy();
                     console.log(`Client ${client.extraNonceAndSessionId} disconnected, hadError?:${hadError}`);
                 }
             });
 
             socket.on('timeout', () => {
                 console.log('socket timeout');
-                socket.end();
                 socket.destroy();
             });
 
-            socket.on('error', async (error: Error) => { });
+            socket.on('error', () => { });
 
             //   //console.log(`Client disconnected, socket error,  ${client.extraNonceAndSessionId}`);
 
@@ -259,6 +262,10 @@ export class StratumV1Service implements OnModuleInit {
 
     private getMaxConnectionsPerListener() {
         return this.getPositiveIntegerEnv('STRATUM_MAX_CONNECTIONS_PER_LISTENER', DEFAULT_MAX_CONNECTIONS_PER_LISTENER);
+    }
+
+    private getTcpKeepAliveInitialDelayMs() {
+        return this.getPositiveIntegerEnv('STRATUM_TCP_KEEPALIVE_INITIAL_DELAY_MS', DEFAULT_TCP_KEEPALIVE_INITIAL_DELAY_MS);
     }
 
     private getStratumPort() {

@@ -2,9 +2,11 @@ import { Injectable } from '@nestjs/common';
 import * as bitcoinjs from 'bitcoinjs-lib';
 import * as merkle from 'merkle-lib';
 import * as merkleProof from 'merkle-lib/proof';
-import { combineLatest, delay, filter, from, interval, map, Observable, shareReplay, startWith, switchMap, tap } from 'rxjs';
+import { catchError, combineLatest, delay, filter, from, interval, map, Observable, of, shareReplay, startWith, Subscription, switchMap, tap, timer } from 'rxjs';
 
 import { MiningJob } from '../models/MiningJob';
+import { IBlockTemplate } from '../models/bitcoin-rpc/IBlockTemplate';
+import { IMiningInfo } from '../models/bitcoin-rpc/IMiningInfo';
 import { BitcoinRpcService } from './bitcoin-rpc.service';
 
 export interface IJobTemplate {
@@ -20,6 +22,9 @@ export interface IJobTemplate {
         clearJobs: boolean;
     };
 }
+
+const JOB_MAX_AGE_MS = 1000 * 60 * 5;
+const JOB_PIPELINE_RETRY_MS = 5_000;
 
 @Injectable()
 export class StratumV1JobsService {
@@ -37,6 +42,8 @@ export class StratumV1JobsService {
     private delay = process.env.NODE_APP_INSTANCE == null ? 0 : parseInt(process.env.NODE_APP_INSTANCE) * 5000;
     private lastBlockHeight = 0;
     private lastWorkSignature: string;
+    /** Keeps the shared job pipeline subscribed for the process lifetime. */
+    private readonly pipelineKeepAlive: Subscription;
 
     constructor(
         private readonly bitcoinRpcService: BitcoinRpcService
@@ -47,14 +54,21 @@ export class StratumV1JobsService {
             : interval(60000).pipe(startWith(-1));
 
         this.newMiningJob$ = combineLatest([this.bitcoinRpcService.newBlock$, refreshInterval$]).pipe(
-            switchMap(([miningInfo, interval]) => {
-                return from(this.bitcoinRpcService.getBlockTemplate(miningInfo.blocks)).pipe(map((blockTemplate) => {
-                    return {
-                        blockTemplate,
-                        miningInfo
-                    }
-                }))
+            switchMap(([miningInfo, _intervalTick]) => {
+                return from(this.bitcoinRpcService.getBlockTemplate(miningInfo.blocks)).pipe(
+                    map((blockTemplate) => {
+                        return {
+                            blockTemplate,
+                            miningInfo
+                        }
+                    }),
+                    catchError((err) => {
+                        console.error('getBlockTemplate failed; will retry on next tick:', (err as Error).message);
+                        return of(null);
+                    }),
+                );
             }),
+            filter((next): next is { blockTemplate: IBlockTemplate; miningInfo: IMiningInfo } => next != null),
             map(({ blockTemplate, miningInfo }) => {
 
                 let clearJobs = false;
@@ -142,25 +156,40 @@ export class StratumV1JobsService {
                 if (data.blockData.clearJobs) {
                     this.blocks = {};
                     this.jobs = {};
-                }else{
-                    const now = new Date().getTime();
-                    // Delete old templates (5 minutes)
-                    for(const templateId in this.blocks){
-                        if(now - this.blocks[templateId].blockData.creation  > (1000 * 60 * 5)){
-                            delete this.blocks[templateId];
-                        }
-                    }
-                    // Delete old jobs (5 minutes)
-                    for (const jobId in this.jobs) {
-                        if(now - this.jobs[jobId].creation > (1000 * 60 * 5)){
-                            delete this.jobs[jobId];
-                        }
-                    }
+                } else {
+                    this.pruneStaleJobs();
                 }
                 this.blocks[data.blockData.id] = data;
             }),
+            catchError((err, caught) => {
+                // Keep the shared stream alive across unexpected map/tap failures.
+                console.error('Mining job pipeline error; retrying:', (err as Error).message);
+                return timer(JOB_PIPELINE_RETRY_MS).pipe(switchMap(() => caught));
+            }),
             shareReplay({ refCount: true, bufferSize: 1 })
-        )
+        );
+
+        // Keep templates flowing even when no miners are connected, so reconnects
+        // immediately receive work instead of waiting for the source to restart.
+        this.pipelineKeepAlive = this.newMiningJob$.subscribe({
+            error: (err) => {
+                console.error('Mining job keep-alive subscription error:', err);
+            },
+        });
+    }
+
+    private pruneStaleJobs() {
+        const now = new Date().getTime();
+        for (const templateId in this.blocks) {
+            if (now - this.blocks[templateId].blockData.creation > JOB_MAX_AGE_MS) {
+                delete this.blocks[templateId];
+            }
+        }
+        for (const jobId in this.jobs) {
+            if (now - this.jobs[jobId].creation > JOB_MAX_AGE_MS) {
+                delete this.jobs[jobId];
+            }
+        }
     }
 
     private calculateNetworkDifficulty(nBits: number) {
